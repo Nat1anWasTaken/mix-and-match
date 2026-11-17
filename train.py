@@ -11,7 +11,7 @@ from src.checkpoint import PretrainedCheckpointer
 from src.data import PackedDataLoader, SequencePacker
 from src.evaluation import DevelopmentEvaluator, load_development_texts
 from src.loggers import ConsoleLogger, WandbLogger
-from src.loss import CrossEntropyLossSum
+from src.loss import LinearCrossEntropySum
 from src.model import LlamaCausalLM, ScalingLlamaConfig
 from src.optimizer import build_muon_adamw, build_warmup_stable_decay
 from src.token_stream import TokenStream
@@ -141,6 +141,14 @@ def parse_arguments() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="torch.compile the model, on by default (--no-compile turns it off)",
+    )
+    parser.add_argument(
+        "--ce-chunk-tokens",
+        type=int,
+        # Fastest on an H200 at 150M (2048-16384 tried): ~8 GB of bf16 [C, V] transients
+        default=16384,
+        help="positions per chunk of the fused lm_head + cross entropy; the largest "
+        "transient is chunk x vocab logits (bf16) plus their gradient",
     )
     parser.add_argument(
         "--attn-implementation",
@@ -297,7 +305,9 @@ def main() -> None:
         if training_model is not model:
             model.compile()
 
-    loss_fn = CrossEntropyLossSum()
+    loss_fn = LinearCrossEntropySum(
+        chunk_tokens=arguments.ce_chunk_tokens, compile=arguments.compile
+    )
     # The stream shards documents across ranks before packing, so each rank only
     # packs its own 1/world_size
     documents = TokenStream(
