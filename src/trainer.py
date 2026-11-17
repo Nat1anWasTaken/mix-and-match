@@ -18,8 +18,8 @@ from .data import Batch, Stateful
 from .loss import CausalLMLossSum
 from .param_stats import ParameterStats
 
-# Positions of the first micro batch whose logsumexp is logged. Their fp32 copy is
-# LOGIT_SAMPLE x vocab (~0.5 GB), against ~17 GB for the whole micro batch
+# Positions of the first micro batch whose logsumexp is logged. The fused loss returns
+# the logsumexp of every position for free; the sample keeps the metric as before
 LOGIT_SAMPLE = 1024
 
 
@@ -111,7 +111,8 @@ def forward_batch(
     model: torch.nn.Module, batch: Batch, device: torch.device, varlen: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Run the model on one packed batch, returning the logits and the labels they line up with
+    Run the model on one packed batch, returning the readout hidden states [B, T, d]
+    (final norm, scaled by 1/m_d, before lm_head) and the labels they line up with
     """
     input_ids = batch["input_ids"]
     labels = batch["labels"]
@@ -145,10 +146,11 @@ def forward_batch(
             input_ids=input_ids.to(device, non_blocking=True),
             position_ids=position_ids.to(device, non_blocking=True),
             use_cache=False,
+            return_logits=False,
             **varlen_kwargs,
         )
 
-    return output.logits, labels.to(device, non_blocking=True)
+    return output.last_hidden_state, labels.to(device, non_blocking=True)
 
 
 def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
@@ -198,6 +200,8 @@ class Trainer:
         )
         self.train_data = train_data
         self.loss_fn = loss_fn
+        # lm_head.weight, tied to the embedding. The fused loss applies it, not the model
+        self.output_weight = self.raw_model.get_output_embeddings().weight
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.evaluator = evaluator
@@ -264,22 +268,25 @@ class Trainer:
                 )
 
                 with sync_context:
-                    logits, labels = forward_batch(
+                    hidden, labels = forward_batch(
                         self.model, batch, device, self.varlen
                     )
-                    loss_sum, num_loss_tokens = self.loss_fn(logits, labels)
-                    loss_sum.backward()
+                    # The tied output weight, used outside the DDP forward. Its gradient
+                    # still flows through this same backward, so DDP's hook on it fires
+                    # once both the embedding and the lm_head parts are accumulated
+                    loss = self.loss_fn(hidden, self.output_weight, labels)
+                    loss.loss_sum.backward()
+                    loss_sum, num_loss_tokens = loss.loss_sum, loss.num_tokens
 
-                # Logit scale, to watch the 1/m_d readout: max over the micro batch (exact
-                # in bf16, so no copy) and mean logsumexp over LOGIT_SAMPLE positions
+                # Logit scale, to watch the 1/m_d readout: max over the micro batch and
+                # mean logsumexp over LOGIT_SAMPLE positions, both returned by the loss
                 if stats is not None and index == 0:
-                    with torch.no_grad():
-                        flat = logits.detach().reshape(-1, logits.shape[-1])
-                        logsumexp = flat[:LOGIT_SAMPLE].float().logsumexp(-1).mean()
-                        logit_stats = torch.stack([logsumexp, flat.amax().float()])
+                    logsumexp = loss.logsumexp[:LOGIT_SAMPLE].mean()
+                    logit_stats = torch.stack([logsumexp, loss.logit_max])
 
-                # Free the logits now, a for loop keeps them alive until the next forward returns
-                del logits
+                # Free the hidden states now, a for loop keeps them alive until the next
+                # forward returns
+                del hidden, loss
 
                 step_stats[0] += loss_sum.detach()
                 step_stats[1] += num_loss_tokens
