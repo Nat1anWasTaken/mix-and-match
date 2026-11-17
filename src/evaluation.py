@@ -92,11 +92,12 @@ class DevelopmentEvaluator:
         totals = torch.zeros(2, dtype=torch.float64, device=device)
 
         for batch in self.batches:
-            logits, labels = forward_batch(model, batch, device, varlen)
-            batch_loss_sum, batch_num_tokens = self.loss_fn(logits, labels)
-            del logits
-            totals[0] += batch_loss_sum
-            totals[1] += batch_num_tokens
+            hidden, labels = forward_batch(model, batch, device, varlen)
+            output_weight = model.get_output_embeddings().weight
+            loss = self.loss_fn(hidden, output_weight, labels)
+            del hidden
+            totals[0] += loss.loss_sum
+            totals[1] += loss.num_tokens
 
         all_reduce_sum(totals)
         loss_sum, num_tokens = totals.tolist()  # the only GPU sync in eval

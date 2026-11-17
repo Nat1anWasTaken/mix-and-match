@@ -4,7 +4,10 @@ from typing import Any, cast
 import torch
 from torch import nn
 from transformers import LlamaConfig, LlamaForCausalLM
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMSNorm
 
 MUP_CONFIG_KEYS = (
@@ -90,8 +93,9 @@ class LlamaCausalLM(LlamaForCausalLM):
         input_ids: torch.LongTensor,
         position_ids: torch.LongTensor | None = None,
         use_cache: bool | None = False,
+        return_logits: bool = True,
         **kwargs: Any,  # noqa: ANN401
-    ) -> CausalLMOutputWithPast:
+    ) -> CausalLMOutputWithPast | BaseModelOutputWithPast:
         # alpha_emb: a tunable constant on the input side (Cerebras 10, MiniCPM 12). Passing
         # inputs_embeds makes HF skip its own embedding lookup
         inputs_embeds = (
@@ -104,9 +108,15 @@ class LlamaCausalLM(LlamaForCausalLM):
             **kwargs,
         )
         # muP readout: logits scaled by 1/m_d, applied in the forward pass rather than the
-        # weight, since the weight is the tied embedding
-        logits = self.lm_head(outputs.last_hidden_state) / self.width_multiplier
-        return CausalLMOutputWithPast(logits=logits)
+        # weight, since the weight is the tied embedding. lm_head is linear with no bias, so
+        # we scale its [B,T,d] input instead of the [B,T,V] logits; the division then fuses
+        # into the final RMSNorm kernel instead of costing an extra pass over the logits
+        readout_hidden = outputs.last_hidden_state / self.width_multiplier
+        if not return_logits:
+            # Training and eval stop here: LinearCrossEntropySum applies lm_head.weight
+            # chunk by chunk, so the full [B,T,V] logits are never materialized
+            return BaseModelOutputWithPast(last_hidden_state=readout_hidden)
+        return CausalLMOutputWithPast(logits=self.lm_head(readout_hidden))
 
     @torch.no_grad()
     def export_plain_llama(self) -> LlamaForCausalLM:
