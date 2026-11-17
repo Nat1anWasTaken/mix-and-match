@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import logging
 import math
 import os
 from collections import namedtuple
@@ -299,6 +300,14 @@ def main() -> None:
 
     # Compile after wrapping, so dynamo sees DDP and keeps all-reduce overlapped with backward
     if arguments.compile:
+        # transformers' flash-attention path logs a warning_once (fp32 q/k cast back to bf16)
+        # inside the compiled region, which dynamo can't trace: a graph break in every layer
+        torch._dynamo.config.ignore_logging_functions.add(logging.Logger.warning_once)
+        # The hub FA3 op has no fake impl, so attention still splits into frames that guard
+        # on module.layer_idx: one compiled entry per layer, two under DDP (train + eval)
+        torch._dynamo.config.recompile_limit = max(
+            8, 2 * model_config.num_hidden_layers + 4
+        )
         training_model.compile()
         # eval runs on the unwrapped model, which the DDP compile above
         # doesn't cover. Compile it too, so eval uses the same kernels as on 1 GPU
