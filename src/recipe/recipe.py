@@ -345,7 +345,14 @@ class RecipeBuilder:
             if documents.size == 0:
                 continue
 
-            if documents.ndim != 1 or numpy.any(numpy.diff(documents) <= 0):
+            if not numpy.issubdtype(documents.dtype, numpy.integer):
+                raise ValueError(
+                    f"selection for shard {shard} has non-integer indices "
+                    f"({documents.dtype})"
+                )
+
+            # Pairwise, not numpy.diff: diff wraps around on unsigned indices
+            if documents.ndim != 1 or numpy.any(documents[1:] <= documents[:-1]):
                 raise ValueError(
                     f"selection for shard {shard} is not sorted and unique"
                 )
@@ -527,7 +534,8 @@ def _selection_path(phase: str, cursor: str, shard: str) -> str:
 
 
 def _check_name(name: str) -> None:
-    if not NAME_PATTERN.match(name):
+    # "." and ".." pass the pattern but would walk the selection paths
+    if not NAME_PATTERN.match(name) or name in (".", ".."):
         raise ValueError(
             f"name {name!r} may only use letters, digits, '.', '_' and '-'"
         )

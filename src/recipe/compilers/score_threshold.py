@@ -140,14 +140,16 @@ def main() -> None:
             eligible=kept,
             exceed=False,
         )
-        builder.add_cursor(
-            "main",
-            f"{arguments.source}-repeat",
-            arguments.source,
-            store,
-            repeat,
-            repeat=True,
-        )
+        # A budget smaller than the best document leaves nothing to repeat
+        if repeat:
+            builder.add_cursor(
+                "main",
+                f"{arguments.source}-repeat",
+                arguments.source,
+                store,
+                repeat,
+                repeat=True,
+            )
 
     if anneal_budget > 0:
         builder.add_phase("anneal")
