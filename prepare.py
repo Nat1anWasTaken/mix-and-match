@@ -25,17 +25,36 @@ Rerunning with the same --output skips finished fragments and shards, so an inte
 run (or an expired S3 key) only needs a rerun with the same --fragments. The bucket
 count comes from the budget, so a different budget needs a different --output and
 --fragments. The --fragments directory can be deleted once manifest.json is written.
+
+On hosts whose compute nodes have no internet (Forerunner1), split it into stages with
+the same arguments (scripts/submit-f1.sh runs all three):
+
+    --stage fetch     login node: caches the tokenizer and development ids, and copies
+                      the first fragments of the shuffled order into --mirror, until
+                      their source token_count reaches --mirror-margin x the budget
+    --stage process   compute node: the two phases above, reading --mirror and writing a
+                      local --output, offline
+    --stage upload    login node: copies the local --output to --remote
+
+metadata.json names --dataset, not the mirror, so the uploaded store is the same as one
+prepared from S3 directly. If the mirror runs out before the budget, process stops
+before phase 2; rerun fetch with a larger --mirror-margin, then process again.
 """
 
 import argparse
+import itertools
 import math
 import multiprocessing
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy
+from lance import LanceDataset
 
 from src.loggers import ConsoleLogger, WandbLogger
+from src.mirror import fetch_fragments, open_mirror, read_mirror
+from src.stages import add_stage_arguments, check_stage, upload_store
 from src.tokenizer import (
     BucketGatherer,
     FragmentTokenizer,
@@ -58,6 +77,8 @@ SHARD_FORMAT = (
 )
 LAYOUT_VERSION = 2
 WANDB_PROJECT = "lab7-data-curation"
+# FineWeb-Edu's per-document GPT-2 token count, which --stage fetch sizes the mirror by
+TOKEN_COUNT_COLUMN = "token_count"
 
 # One per worker process, built by initialize_tokenizer or initialize_gatherer
 tokenizer_worker: FragmentTokenizer | None = None
@@ -66,6 +87,7 @@ gatherer_worker: BucketGatherer | None = None
 
 def initialize_tokenizer(
     dataset_uri: str,
+    dataset_version: int,
     tokenizer_name: str,
     exclude_ids: frozenset[str],
     fragments_uri: str,
@@ -79,7 +101,7 @@ def initialize_tokenizer(
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     tokenizer_worker = FragmentTokenizer(
-        open_dataset(dataset_uri),
+        open_dataset(dataset_uri, dataset_version),
         load_tokenizer(tokenizer_name),
         exclude_ids,
         ShardStore(fragments_uri),
@@ -158,16 +180,122 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--development-dataset", default=DEVELOPMENT_DATASET)
     parser.add_argument("--run-name", required=True, help="names the wandb run")
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
+    add_stage_arguments(parser)
+    parser.add_argument(
+        "--mirror-margin",
+        type=float,
+        default=1.25,
+        help="--stage fetch mirrors source token_count up to this x --token-budget. "
+        "token_count is GPT-2's, which runs above Llama 3's",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     arguments = parse_arguments()
+    check_stage(arguments, "output", "fragments")
+
+    if arguments.stage == "fetch":
+        fetch(arguments)
+    elif arguments.stage == "upload":
+        upload(arguments)
+    else:
+        process(arguments)
+
+
+def select_fragments(
+    dataset: LanceDataset, fragment_ids: list[int], target_tokens: float, workers: int
+) -> tuple[list[int], int]:
+    """
+    The shortest prefix of fragment_ids whose source token_count reaches target_tokens,
+    and that count. Reads only the token_count column, a chunk of fragments at a time
+    """
+
+    def count(fragment_id: int) -> int:
+        fragment = dataset.get_fragment(fragment_id)
+
+        if fragment is None:
+            raise ValueError(f"fragment {fragment_id} does not exist")
+
+        column = fragment.to_table(columns=[TOKEN_COUNT_COLUMN]).column(0)
+        # nansum: a column with nulls comes out as float with NaN for them
+        return int(numpy.nansum(column.to_numpy(zero_copy_only=False)))
+
+    selected: list[int] = []
+    total = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for start in range(0, len(fragment_ids), workers):
+            chunk = fragment_ids[start : start + workers]
+
+            for fragment_id, tokens in zip(chunk, pool.map(count, chunk), strict=True):
+                selected.append(fragment_id)
+                total += tokens
+
+                if total >= target_tokens:
+                    return selected, total
+
+    return selected, total
+
+
+def fetch(arguments: argparse.Namespace) -> None:
+    """
+    Everything --stage process reads from the internet, cached or mirrored locally
+    """
+    # Keep the mirror's version once there is one, so a newer source version can't
+    # quietly mix into it
+    existing = read_mirror(arguments.mirror)
+    dataset = open_dataset(
+        arguments.dataset, existing.version if existing is not None else None
+    )
+
+    load_tokenizer(arguments.tokenizer)
+    load_development_ids(arguments.development_dataset, DEVELOPMENT_SIZE)
+
+    workers = min(arguments.workers, 32)
+    fragment_ids = shuffled_fragment_ids(dataset, arguments.seed)
+    selected, source_tokens = select_fragments(
+        dataset,
+        fragment_ids,
+        arguments.token_budget * arguments.mirror_margin,
+        workers,
+    )
+    print(
+        f"{len(selected)} of {len(fragment_ids)} fragments hold {source_tokens:,} "
+        f"source tokens, {arguments.mirror_margin}x the budget",
+        flush=True,
+    )
+
+    fetch_fragments(
+        arguments.dataset, dataset.version, arguments.mirror, selected, workers
+    )
+
+
+def upload(arguments: argparse.Namespace) -> None:
+    store = ShardStore(arguments.output)
+
+    if store.read_json("manifest.json") is None:
+        raise FileNotFoundError(
+            f"no manifest.json in {store.uri}; --stage process has not finished"
+        )
+
+    upload_store(store.uri, arguments.remote)
+
+
+def process(arguments: argparse.Namespace) -> None:
     store = ShardStore(arguments.output)
     fragment_store = ShardStore(
         arguments.fragments or arguments.output.rstrip("/") + "/fragments"
     )
-    dataset = open_dataset(arguments.dataset)
+
+    if arguments.stage == "process":
+        mirror = open_mirror(arguments.mirror, arguments.dataset)
+        dataset_uri = os.path.abspath(arguments.mirror)
+        dataset = open_dataset(dataset_uri, mirror.version)
+    else:
+        mirror = None
+        dataset_uri = arguments.dataset
+        dataset = open_dataset(dataset_uri)
 
     num_buckets = math.ceil(arguments.token_budget / arguments.shard_tokens)
 
@@ -199,6 +327,15 @@ def main() -> None:
 
     exclude_ids = load_development_ids(arguments.development_dataset, DEVELOPMENT_SIZE)
     fragment_ids = shuffled_fragment_ids(dataset, arguments.seed)
+    # The mirror lists every fragment but holds the data of a prefix of this order only
+    mirror_ran_out = False
+
+    if mirror is not None:
+        mirrored = list(
+            itertools.takewhile(lambda i: i in mirror.fragment_ids, fragment_ids)
+        )
+        mirror_ran_out = len(mirrored) < len(fragment_ids)
+        fragment_ids = mirrored
 
     fragments: list[dict[str, int]] = []
     bucket_offsets: list[Offsets] = []
@@ -214,7 +351,8 @@ def main() -> None:
         arguments.workers,
         initializer=initialize_tokenizer,
         initargs=(
-            arguments.dataset,
+            dataset_uri,
+            dataset.version,
             arguments.tokenizer,
             exclude_ids,
             fragment_store.uri,
@@ -249,6 +387,15 @@ def main() -> None:
         # Their shards never got offsets.npy, so a rerun redoes them
 
     if total_tokens < arguments.token_budget:
+        if mirror_ran_out:
+            # Phase 2 needs the final fragment list, so stop before it. The tokenized
+            # fragments are kept, and the rerun only tokenizes the new ones
+            raise RuntimeError(
+                f"the mirror ran out at {total_tokens:,} of {arguments.token_budget:,} "
+                f"tokens after {len(fragments)} fragments; rerun --stage fetch with a "
+                "larger --mirror-margin, then --stage process again"
+            )
+
         print(f"warning: dataset ran out at {total_tokens} tokens", flush=True)
 
     shards: list[dict[str, object]] = []

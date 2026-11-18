@@ -28,6 +28,7 @@ from ..metadata import (
     is_complete,
     join_onto_shards,
     open_source_dataset,
+    source_dataset,
     source_fragment_ids,
 )
 
@@ -92,21 +93,21 @@ def score_texts(
     info: Mapping[str, object],
     workers: int = os.cpu_count() or 1,
     batch_size: int = 1024,
+    mirror: str | None = None,
 ) -> None:
     """
     Scores every row of the store's source fragments and writes meta/<kind>/. info
-    names the scorer and its settings; a different info needs a different kind
+    names the scorer and its settings; a different info needs a different kind. The
+    fragments are read from mirror if given
     """
-    dataset = open_source_dataset(store)
-    ensure_info(
-        store,
-        kind,
-        {**info, "dataset": dataset.uri, "dataset_version": dataset.version},
-    )
+    source, version = source_dataset(store)
+    ensure_info(store, kind, {**info, "dataset": source, "dataset_version": version})
 
     if is_complete(store, kind):
         print(f"{store.uri} already has every shard of meta/{kind}", flush=True)
         return
+
+    dataset = open_source_dataset(store, mirror)
 
     # spawn, not fork: Lance runs background threads, and forking them can deadlock
     context = multiprocessing.get_context("spawn")

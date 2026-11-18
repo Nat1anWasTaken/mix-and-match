@@ -7,6 +7,11 @@ also appear in Paloma's evaluation data.
 
 Paloma is gated: accept its terms on Hugging Face and log in (`hf auth login`) first.
 
+Takes --stage like prepare.py (see src/stages.py): fetch downloads Paloma into the
+Hugging Face cache and mirrors the store's source fragments, process scores offline from
+the cache and --mirror, upload copies the store to --remote. Pass the same --revision to
+every stage, or none to use what fetch cached as the latest.
+
 Following the paper:
   - text is matched at the paragraph level, i.e. newline-separated spans
   - evaluation paragraphs shorter than 13 Unicode-segmented tokens are ignored, which
@@ -35,9 +40,11 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import numpy
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import snapshot_download
 
+from ...stages import add_stage_arguments, check_stage, upload_store
 from ...tokenizer import ShardStore
+from ..metadata import fetch_source_fragments, is_complete
 from .text import ScoreFunction, score_texts
 
 PALOMA_REPOSITORY = "allenai/paloma"
@@ -65,20 +72,24 @@ def paragraph_hash(paragraph: str) -> int:
 
 def download_paloma(revision: str | None) -> tuple[Path, str]:
     """
-    The val and test files of every Paloma source, and the commit they are from
+    The val and test files of every Paloma source, and the commit they are from.
+    With HF_HUB_OFFLINE=1 the revision (default: main) resolves from the local cache
     """
-    commit = HfApi().dataset_info(PALOMA_REPOSITORY, revision=revision).sha
-
-    if commit is None:
-        raise ValueError(f"cannot resolve {PALOMA_REPOSITORY}@{revision}")
-
-    path = snapshot_download(
-        PALOMA_REPOSITORY,
-        repo_type="dataset",
-        revision=commit,
-        allow_patterns=["*/val/*.jsonl.gz", "*/test/*.jsonl.gz"],
+    path = Path(
+        snapshot_download(
+            PALOMA_REPOSITORY,
+            repo_type="dataset",
+            revision=revision,
+            allow_patterns=["*/val/*.jsonl.gz", "*/test/*.jsonl.gz"],
+        )
     )
-    return Path(path), commit
+    # The cache keeps each snapshot in a directory named by its commit
+    commit = path.name
+
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError(f"cannot tell the commit of {PALOMA_REPOSITORY} from {path}")
+
+    return path, commit
 
 
 def evaluation_hashes(root: Path, sources: list[str] | None) -> numpy.ndarray:
@@ -148,9 +159,27 @@ def main() -> None:
         help="Paloma sources to match against, e.g. c4_en ptb; default: all of them",
     )
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1)
+    add_stage_arguments(parser)
     arguments = parser.parse_args()
+    check_stage(arguments, "store")
+
+    store = ShardStore(arguments.store)
+
+    if arguments.stage == "upload":
+        if not is_complete(store, arguments.kind):
+            raise FileNotFoundError(
+                f"{store.uri} lacks shards of meta/{arguments.kind}"
+            )
+
+        upload_store(store.uri, arguments.remote)
+        return
 
     root, commit = download_paloma(arguments.revision)
+    print(f"{PALOMA_REPOSITORY} at {commit}", flush=True)
+
+    if arguments.stage == "fetch":
+        fetch_source_fragments(store, arguments.mirror, min(arguments.workers, 32))
+        return
     hashes = evaluation_hashes(root, arguments.sources)
     print(f"{hashes.size:,} unique Paloma paragraphs", flush=True)
 
@@ -171,11 +200,12 @@ def main() -> None:
         hashes_path = os.path.join(directory, "hashes.npy")
         numpy.save(hashes_path, hashes)
         score_texts(
-            ShardStore(arguments.store),
+            store,
             arguments.kind,
             functools.partial(build, hashes_path),
             info,
             arguments.workers,
+            mirror=arguments.mirror,
         )
 
 
