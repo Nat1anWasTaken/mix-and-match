@@ -3,7 +3,7 @@
 #
 #   mkdir -p logs
 #   sbatch --job-name=150M-baseline scripts/train.sbatch \
-#       --data s3://<bucket>/fineweb-edu-llama3 --model-size 150M \
+#       --recipe s3://<bucket>/recipes/fwedu-identity-30b --model-size 150M \
 #       --total-tokens 30000000000 --run-name 150M-baseline --compile
 #
 # H200-hours = GPUs x wall time, so --time is what bounds the grant a run can use.
