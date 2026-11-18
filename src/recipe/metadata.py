@@ -12,8 +12,13 @@ kind); compilers read them, which is cheap: a float32 column of a 30M-document s
 Scores that need the source dataset (its columns or its text) come from a sequential
 scan of the source's Lance fragments, joined onto the shards through row_ids.npy. A
 shard's documents come from every fragment, so random takes per shard would be slow.
+
+Offline, the scan reads a local mirror of the source (src/mirror.py) instead. info.json
+still names the source from metadata.json, never the mirror, so a column scored from a
+mirror matches one scored from S3.
 """
 
+import os
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,7 +26,8 @@ import lance
 import numpy
 from lance import LanceDataset
 
-from ..tokenizer import RowIds, ShardStore
+from ..mirror import check_mirrored, fetch_fragments, open_mirror
+from ..tokenizer import RowIds, ShardStore, open_dataset
 from .recipe import read_shard_names
 
 META = "meta"
@@ -79,10 +85,10 @@ def read_columns(
         return dict(zip(names, columns, strict=True))
 
 
-def open_source_dataset(store: ShardStore) -> LanceDataset:
+def source_dataset(store: ShardStore) -> tuple[str, int]:
     """
-    The Lance dataset the store was prepared from, at the version it was prepared from.
-    Row addresses are only valid within that version
+    The URI and version of the Lance dataset the store was prepared from. Row addresses
+    are only valid within that version
     """
     metadata = store.read_json("metadata.json")
 
@@ -97,7 +103,31 @@ def open_source_dataset(store: ShardStore) -> LanceDataset:
     if not isinstance(version, int):
         raise TypeError(f"{store.uri} metadata.json has no integer dataset_version")
 
-    return lance.dataset(str(metadata["dataset"]), version=version)
+    return str(metadata["dataset"]), version
+
+
+def open_source_dataset(store: ShardStore, mirror: str | None = None) -> LanceDataset:
+    """
+    The source dataset at the store's version, read from mirror if given. Use
+    source_dataset for its name, since dataset.uri is the mirror's path
+    """
+    uri, version = source_dataset(store)
+
+    if mirror is None:
+        return lance.dataset(uri, version=version)
+
+    info = open_mirror(mirror, uri, version)
+    check_mirrored(info, mirror, source_fragment_ids(store))
+    return open_dataset(os.path.abspath(mirror), version)
+
+
+def fetch_source_fragments(store: ShardStore, mirror: str, workers: int = 16) -> None:
+    """
+    Mirrors the source fragments the store was prepared from; a no-op when prepare.py
+    --stage fetch already did
+    """
+    uri, version = source_dataset(store)
+    fetch_fragments(uri, version, mirror, source_fragment_ids(store), workers)
 
 
 def source_fragment_ids(store: ShardStore) -> list[int]:
