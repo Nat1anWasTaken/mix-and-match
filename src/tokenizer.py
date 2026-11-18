@@ -1,5 +1,6 @@
 import io
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
@@ -19,6 +20,32 @@ type Offsets = numpy.ndarray[tuple[int], numpy.dtype[numpy.int64]]
 type RowIds = numpy.ndarray[tuple[int], numpy.dtype[numpy.int64]]
 
 
+def open_filesystem(uri: str) -> tuple[pyarrow.fs.FileSystem, str]:
+    """
+    The filesystem and root path of a local path or s3:// URI.
+
+    pyarrow's S3 client looks for CA certificates where Debian keeps them, so on RHEL
+    hosts (Forerunner1) every request fails TLS verification. FileSystem.from_uri has
+    no option for it, so with AWS_CA_BUNDLE set, S3 gets an S3FileSystem built with
+    that bundle; the endpoint and keys still come from the usual AWS_* variables
+    """
+    if "://" not in uri:
+        uri = str(Path(uri).absolute())
+
+    ca_bundle = os.environ.get("AWS_CA_BUNDLE")
+
+    if uri.startswith("s3://") and ca_bundle:
+        endpoint = os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get(
+            "AWS_ENDPOINT_URL"
+        )
+        filesystem = pyarrow.fs.S3FileSystem(
+            endpoint_override=endpoint, tls_ca_file_path=ca_bundle
+        )
+        return filesystem, uri.removeprefix("s3://").rstrip("/")
+
+    return pyarrow.fs.FileSystem.from_uri(uri)
+
+
 class ShardStore:
     """
     A store of token shards. Each shard lives under data/<name>/ with tokens.npy,
@@ -33,7 +60,7 @@ class ShardStore:
 
         self.uri = uri
 
-        filesystem, root = pyarrow.fs.FileSystem.from_uri(uri)
+        filesystem, root = open_filesystem(uri)
 
         self.filesystem: pyarrow.fs.FileSystem = filesystem
         self.root = PurePosixPath(root)
@@ -213,8 +240,8 @@ def load_development_ids(repository_id: str, expected_size: int) -> frozenset[st
     return frozenset(document_ids)
 
 
-def open_dataset(uri: str) -> LanceDataset:
-    return lance.dataset(uri)
+def open_dataset(uri: str, version: int | None = None) -> LanceDataset:
+    return lance.dataset(uri, version=version)
 
 
 def shuffled_fragment_ids(dataset: LanceDataset, seed: int) -> list[int]:
