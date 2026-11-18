@@ -2,7 +2,7 @@
 # Pre-tokenize FineWeb-Edu on a compute node. All arguments go straight to prepare.py:
 #
 #   mkdir -p logs
-#   sbatch scripts/prepare.sbatch --output s3://<bucket>/fineweb-edu-llama3 --token-budget 30000000000
+#   sbatch scripts/prepare.sbatch --output s3://<bucket>/sources/fineweb-edu-llama3 --token-budget 30000000000
 #
 # prepare.py skips finished shards, so if the 4h dev limit runs out, just submit it again.
 #SBATCH --job-name=prepare
