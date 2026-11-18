@@ -17,6 +17,7 @@ through row_ids.npy afterwards.
 import multiprocessing
 import os
 from collections.abc import Callable, Mapping
+from concurrent.futures import ProcessPoolExecutor
 
 import lance
 import numpy
@@ -112,12 +113,15 @@ def score_texts(
     # spawn, not fork: Lance runs background threads, and forking them can deadlock
     context = multiprocessing.get_context("spawn")
 
-    with context.Pool(
+    # ProcessPoolExecutor, not Pool: a Pool respawns workers whose initializer
+    # failed forever and map never returns, while this raises BrokenProcessPool
+    with ProcessPoolExecutor(
         workers,
+        mp_context=context,
         initializer=_initialize,
         initargs=(dataset.uri, dataset.version, factory, batch_size),
     ) as pool:
-        parts = pool.map(_score_fragment, source_fragment_ids(store))
+        parts = list(pool.map(_score_fragment, source_fragment_ids(store)))
 
     addresses = numpy.concatenate([part[0] for part in parts])
     scores = numpy.concatenate([part[1] for part in parts])

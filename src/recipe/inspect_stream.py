@@ -40,13 +40,14 @@ def autocorrelation(series: numpy.ndarray, max_lag: int) -> numpy.ndarray:
     )
 
 
-def report(name: str, series: numpy.ndarray, max_lag: int) -> bool:
+def report(name: str, series: numpy.ndarray, max_lag: int) -> bool | None:
     """
-    Prints the lags outside the white-noise band; True when there are none
+    Prints the lags outside the white-noise band; True when there are none, None when
+    the series is too short to check
     """
     if series.size < 3:
-        print(f"  {name}: too few steps")
-        return True
+        print(f"  {name}: too few steps ({series.size}), not checked")
+        return None
 
     lags = min(max_lag, series.size - 1)
     values = autocorrelation(series, lags)
@@ -133,7 +134,16 @@ def main() -> None:
             ):
                 break
 
-    all_stationary = True
+    results: list[bool] = []
+
+    def check(name: str, series: numpy.ndarray) -> None:
+        result = report(name, series, arguments.max_lag)
+
+        if result is not None:
+            results.append(result)
+
+    if len(sources) == 1 and arguments.kind is None:
+        print("one source and no --kind: no series to check")
 
     for phase_index, phase_steps in steps.items():
         table = numpy.stack(phase_steps)
@@ -143,19 +153,18 @@ def main() -> None:
         for source in sources:
             share = table[:, source_index[source]] / step_tokens
             if len(sources) > 1:
-                all_stationary &= report(f"share of {source}", share, arguments.max_lag)
+                check(f"share of {source}", share)
 
         if arguments.kind is not None:
             mean_score = table[:, -1] / step_tokens
-            all_stationary &= report(
-                f"mean {arguments.kind}", mean_score, arguments.max_lag
-            )
+            check(f"mean {arguments.kind}", mean_score)
 
-    print(
-        "stationary"
-        if all_stationary
-        else "NOT STATIONARY: check the recipe and shards"
-    )
+    if not results:
+        print("INCONCLUSIVE: no series had enough steps to check")
+    elif all(results):
+        print("stationary")
+    else:
+        print("NOT STATIONARY: check the recipe and shards")
 
 
 if __name__ == "__main__":
