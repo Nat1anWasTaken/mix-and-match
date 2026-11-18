@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import logging
 import math
 import os
 from collections import namedtuple
@@ -11,7 +12,7 @@ from src.checkpoint import PretrainedCheckpointer
 from src.data import PackedDataLoader, SequencePacker
 from src.evaluation import DevelopmentEvaluator, load_development_texts
 from src.loggers import ConsoleLogger, WandbLogger
-from src.loss import CrossEntropyLossSum
+from src.loss import LinearCrossEntropySum
 from src.model import LlamaCausalLM, ScalingLlamaConfig
 from src.optimizer import build_muon_adamw, build_warmup_stable_decay
 from src.recipe.recipe import load_recipe
@@ -149,6 +150,14 @@ def parse_arguments() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="torch.compile the model, on by default (--no-compile turns it off)",
+    )
+    parser.add_argument(
+        "--ce-chunk-tokens",
+        type=int,
+        # Fastest on an H200 at 150M (2048-16384 tried): ~8 GB of bf16 [C, V] transients
+        default=16384,
+        help="positions per chunk of the fused lm_head + cross entropy; the largest "
+        "transient is chunk x vocab logits (bf16) plus their gradient",
     )
     parser.add_argument(
         "--attn-implementation",
@@ -299,13 +308,23 @@ def main() -> None:
 
     # Compile after wrapping, so dynamo sees DDP and keeps all-reduce overlapped with backward
     if arguments.compile:
+        # transformers' flash-attention path logs a warning_once (fp32 q/k cast back to bf16)
+        # inside the compiled region, which dynamo can't trace: a graph break in every layer
+        torch._dynamo.config.ignore_logging_functions.add(logging.Logger.warning_once)
+        # The hub FA3 op has no fake impl, so attention still splits into frames that guard
+        # on module.layer_idx: one compiled entry per layer, two under DDP (train + eval)
+        torch._dynamo.config.recompile_limit = max(
+            8, 2 * model_config.num_hidden_layers + 4
+        )
         training_model.compile()
         # eval runs on the unwrapped model, which the DDP compile above
         # doesn't cover. Compile it too, so eval uses the same kernels as on 1 GPU
         if training_model is not model:
             model.compile()
 
-    loss_fn = CrossEntropyLossSum()
+    loss_fn = LinearCrossEntropySum(
+        chunk_tokens=arguments.ce_chunk_tokens, compile=arguments.compile
+    )
     recipe = load_recipe(arguments.recipe)
 
     # Compilers add a small margin on top, since the ranks' shares vary a little and
