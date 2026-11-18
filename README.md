@@ -23,7 +23,8 @@ flowchart TB
     LM -.-> MI["CausalLM Interface"]
     HF["HF LlamaForCausalLM"] -.-> MI
 
-    TS["TokenStream"] --> PK["SequencePacker"]
+    RC["Compiled recipe"] --> TS["RecipeTokenStream"]
+    TS --> PK["SequencePacker"]
     PK --> DL["DataLoader"]
     DL --> TR["Trainer"]
 

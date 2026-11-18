@@ -1,7 +1,7 @@
 import contextlib
 import dataclasses
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -180,6 +180,7 @@ class Trainer:
         ckpt: Checkpointer,
         logger: Logger,
         cfg: TrainingConfig,
+        data_stats: Callable[[], dict[str, int]] | None = None,
     ) -> None:
         # Note we do not perform any validation here, since we already do it in the config
         self.model = model
@@ -208,6 +209,11 @@ class Trainer:
         self.ckpt = ckpt
         self.logger = logger
         self.cfg = cfg
+        # Per-rank counters of the data stream, summed over ranks on log steps. Every
+        # rank must report the same keys, since they share one all-reduce
+        self.data_stats = data_stats
+        # The global data counters as of the last log step
+        self.data_metrics: dict[str, float] = {}
         self.state = TrainerState()
         # DDP raises on parameters that get no gradient, so every one of these has a grad
         self.params = [p for p in self.raw_model.parameters() if p.requires_grad]
@@ -232,12 +238,9 @@ class Trainer:
             # tokens_seen counts all ranks, each rank only covers 1/world_size of it
             remaining_tokens = self.cfg.total_tokens - self.state.tokens_seen
             local_remaining_tokens = remaining_tokens // self.world_size
+            # Repeats are part of the recipe, so running out of data is an error, never
+            # a cue to start the stream over
             batches = self._get_batch_samples(train_iter, local_remaining_tokens)
-            if not batches:
-                train_iter = iter(self.train_data)
-                batches = self._get_batch_samples(train_iter, local_remaining_tokens)
-                if not batches:
-                    raise ValueError("No batches found even after resetting train_iter")
 
             # Same layout as log_stats, for this step only. Kept on the GPU so the
             # micro-batch loop never waits for the GPU to catch up
@@ -334,6 +337,9 @@ class Trainer:
 
             # Log metrics at the end of each log_every_steps interval and at the last step
             if is_log_step:
+                # Every rank joins this all-reduce, not just the one that logs
+                self.data_metrics = self._gather_data_stats()
+
                 if self.rank == 0:
                     # One GPU -> CPU copy for every value of this log
                     parts = [log_stats, grad_norm.reshape(1)]
@@ -366,6 +372,9 @@ class Trainer:
                         rest = rest[2:]
                     if self.param_stats is not None and param_norms is not None:
                         metrics.update(self.param_stats.to_metrics(rest))
+                    metrics.update(
+                        {f"data/{key}": value for key, value in self.data_metrics.items()}
+                    )
                     # One learning rate per param group, named when the group has a name
                     for index, group in enumerate(self.optimizer.param_groups):
                         name = group.get("name", str(index))
@@ -449,6 +458,19 @@ class Trainer:
         cast(Stateful, self.train_data).load_state_dict(state["data"][self.rank])
         self.state = TrainerState(**state["trainer"])
 
+    def _gather_data_stats(self) -> dict[str, float]:
+        if self.data_stats is None:
+            return {}
+
+        stats = self.data_stats()
+        keys = sorted(stats)
+        # float64 holds token counts exactly up to 2^53
+        values = torch.tensor(
+            [float(stats[key]) for key in keys], dtype=torch.float64, device=self.device
+        )
+        all_reduce_sum(values)
+        return dict(zip(keys, values.tolist(), strict=True))
+
     def _get_batch_samples(
         self,
         train_iter: Iterator[Batch],
@@ -463,8 +485,13 @@ class Trainer:
             if remaining_tokens <= 0:
                 break
             batch = next(train_iter, None)
+            # A rank that runs dry would skip collectives the others wait on and hang
+            # them, so fail loudly instead. Compile recipes with a small token margin
             if batch is None:
-                break
+                raise RuntimeError(
+                    f"rank {self.rank} ran out of data with {remaining_tokens} of its "
+                    "tokens left; the recipe holds fewer tokens than --total-tokens"
+                )
             batch_size = batch["input_ids"].shape[0]
             n_sequences = min(batch_size, remaining_tokens // self.cfg.seq_len)
 
