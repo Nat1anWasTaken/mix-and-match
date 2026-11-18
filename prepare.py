@@ -2,9 +2,14 @@
 Pre-tokenize FineWeb-Edu into globally shuffled shards, until a token budget.
 
     eval "$(flock s3 credentials --ttl 24h)"
-    uv run prepare.py --output s3://<bucket>/fineweb-edu-llama3 --token-budget 30000000000 \\
+    uv run prepare.py --output s3://<bucket>/sources/fineweb-edu-llama3 \\
+        --token-budget 30000000000 \\
         --fragments /work/<user>/fragments/fineweb-edu-llama3 \\
         --run-name prepare-fineweb-edu-llama3
+
+Each output shard is data/<bucket>/ with tokens.npy, offsets.npy and row_ids.npy. Row
+ids are the documents' Lance _rowaddr, so scorers under src/recipe/ can join any
+column of the source dataset back onto the shards and write it under meta/.
 
 A two-pass shuffle:
   1. Tokenize fragments in a fixed shuffled order until the budget. Every document draws
@@ -48,10 +53,11 @@ DATASET_URI = "s3://flock-datasets/fineweb-edu"
 DEVELOPMENT_DATASET = "cerulean-works/fineweb-edu-dev"
 DEVELOPMENT_SIZE = 5000
 SHARD_FORMAT = (
-    "[BOS, text, EOS] int32 tokens.npy + int64 offsets.npy, "
-    "globally shuffled into buckets"
+    "data/<shard>/: [BOS, text, EOS] int32 tokens.npy + int64 offsets.npy + "
+    "int64 row_ids.npy (Lance _rowaddr), globally shuffled into buckets"
 )
-WANDB_PROJECT = "lab6-predictable-scaling"
+LAYOUT_VERSION = 2
+WANDB_PROJECT = "lab7-data-curation"
 
 # One per worker process, built by initialize_tokenizer or initialize_gatherer
 tokenizer_worker: FragmentTokenizer | None = None
@@ -144,7 +150,7 @@ def parse_arguments() -> argparse.Namespace:
         default=50_000_000,
         help="target tokens per output shard; sets the bucket count from the budget",
     )
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--tokenizer", default=TOKENIZER_NAME)
@@ -173,6 +179,7 @@ def main() -> None:
         "dataset_version": dataset.version,
         "development_dataset": arguments.development_dataset,
         "format": SHARD_FORMAT,
+        "layout": LAYOUT_VERSION,
         "seed": arguments.seed,
         "num_buckets": num_buckets,
     }

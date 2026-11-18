@@ -15,8 +15,18 @@ from .data import TokenArray
 
 type Offsets = numpy.ndarray[tuple[int], numpy.dtype[numpy.int64]]
 
+# Lance _rowaddr of each document: fragment_id << 32 | row offset inside the fragment
+type RowIds = numpy.ndarray[tuple[int], numpy.dtype[numpy.int64]]
+
 
 class ShardStore:
+    """
+    A store of token shards. Each shard lives under data/<name>/ with tokens.npy,
+    offsets.npy and row_ids.npy (plus bucket_offsets.npy for phase 1 fragments).
+    Other per-document arrays, like scores under meta/, sit beside data/ and are read
+    with read_array / write_array
+    """
+
     def __init__(self, uri: str) -> None:
         if "://" not in uri:
             uri = str(Path(uri).absolute())
@@ -29,40 +39,72 @@ class ShardStore:
         self.root = PurePosixPath(root)
 
     def has_shard(self, name: str) -> bool:
-        return self._is_file(self._path(name, "offsets.npy"))
+        return self._is_file(self._shard_path(name, "offsets.npy"))
 
     def read_offsets(self, name: str) -> Offsets:
-        return self._load(self._path(name, "offsets.npy"))
+        return self._load(self._shard_path(name, "offsets.npy"))
 
     def read_tokens(self, name: str) -> TokenArray:
-        return self._load(self._path(name, "tokens.npy"))
+        return self._load(self._shard_path(name, "tokens.npy"))
+
+    def read_row_ids(self, name: str) -> RowIds:
+        return self._load(self._shard_path(name, "row_ids.npy"))
 
     def read_bucket_offsets(self, name: str) -> Offsets:
-        return self._load(self._path(name, "bucket_offsets.npy"))
+        return self._load(self._shard_path(name, "bucket_offsets.npy"))
 
     def read_offsets_slice(self, name: str, start: int, stop: int) -> Offsets:
-        return self._load_slice(self._path(name, "offsets.npy"), start, stop)
+        return self._load_slice(self._shard_path(name, "offsets.npy"), start, stop)
 
     def read_tokens_slice(self, name: str, start: int, stop: int) -> TokenArray:
-        return self._load_slice(self._path(name, "tokens.npy"), start, stop)
+        return self._load_slice(self._shard_path(name, "tokens.npy"), start, stop)
+
+    def read_row_ids_slice(self, name: str, start: int, stop: int) -> RowIds:
+        return self._load_slice(self._shard_path(name, "row_ids.npy"), start, stop)
 
     def write_shard(
         self,
         name: str,
         tokens: TokenArray,
         offsets: Offsets,
+        row_ids: RowIds,
         bucket_offsets: Offsets | None = None,
     ) -> None:
-        self.filesystem.create_dir(str(self._path(name)), recursive=True)
-        self._save(self._path(name, "tokens.npy"), tokens)
+        if row_ids.size != offsets.size - 1:
+            raise ValueError(
+                f"shard {name} has {offsets.size - 1} documents but {row_ids.size} row ids"
+            )
+
+        self.filesystem.create_dir(str(self._shard_path(name)), recursive=True)
+        self._save(self._shard_path(name, "tokens.npy"), tokens)
+        self._save(self._shard_path(name, "row_ids.npy"), row_ids)
 
         if bucket_offsets is not None:
-            self._save(self._path(name, "bucket_offsets.npy"), bucket_offsets)
+            self._save(self._shard_path(name, "bucket_offsets.npy"), bucket_offsets)
 
         # Commit point: offsets.npy only appears once it is fully written
-        temporary_path = self._path(name, "offsets.npy.tmp")
+        temporary_path = self._shard_path(name, "offsets.npy.tmp")
         self._save(temporary_path, offsets)
-        self.filesystem.move(str(temporary_path), str(self._path(name, "offsets.npy")))
+        self.filesystem.move(
+            str(temporary_path), str(self._shard_path(name, "offsets.npy"))
+        )
+
+    def has_array(self, name: str) -> bool:
+        return self._is_file(self._path(name))
+
+    def read_array(self, name: str) -> numpy.ndarray:
+        """
+        An .npy file at a path relative to the store root, e.g. meta/<kind>/<shard>.npy
+        """
+        return self._load(self._path(name))
+
+    def write_array(self, name: str, array: numpy.ndarray) -> None:
+        path = self._path(name)
+        self.filesystem.create_dir(str(path.parent), recursive=True)
+
+        temporary_path = self._path(name + ".tmp")
+        self._save(temporary_path, array)
+        self.filesystem.move(str(temporary_path), str(path))
 
     def read_json(self, name: str) -> dict[str, object] | None:
         path = self._path(name)
@@ -74,7 +116,7 @@ class ShardStore:
             return json.loads(stream.read())
 
     def write_json(self, name: str, content: dict[str, object]) -> None:
-        self.filesystem.create_dir(str(self.root), recursive=True)
+        self.filesystem.create_dir(str(self._path(name).parent), recursive=True)
 
         temporary_path = self._path(name + ".tmp")
 
@@ -88,6 +130,9 @@ class ShardStore:
 
     def _path(self, *parts: str) -> PurePosixPath:
         return self.root.joinpath(*parts)
+
+    def _shard_path(self, name: str, *parts: str) -> PurePosixPath:
+        return self._path("data", name, *parts)
 
     def _is_file(self, path: PurePosixPath) -> bool:
         # A missing path doesn't raise, it reports FileType.NotFound
@@ -225,9 +270,11 @@ class FragmentTokenizer:
             )
 
         documents: list[TokenArray] = []
+        row_id_parts: list[RowIds] = []
 
-        for texts in self._iter_texts(fragment_id):
+        for texts, row_ids in self._iter_texts(fragment_id):
             documents.extend(self._encode(texts))
+            row_id_parts.append(row_ids)
 
         # Every document draws its bucket independently and uniformly. The draws depend
         # only on (seed, fragment_id), not on which worker runs it or when
@@ -236,6 +283,8 @@ class FragmentTokenizer:
 
         order = numpy.argsort(buckets, kind="stable")
         documents = [documents[i] for i in order]
+        # The row ids go through the same reordering, so row_ids[i] stays document i's
+        row_ids = self._concatenate_row_ids(row_id_parts)[order]
 
         bucket_offsets = numpy.zeros(self.num_buckets + 1, dtype=numpy.int64)
         numpy.cumsum(
@@ -245,8 +294,15 @@ class FragmentTokenizer:
 
         tokens, offsets = self._concatenate(documents)
 
-        self.store.write_shard(name, tokens, offsets, bucket_offsets)
+        self.store.write_shard(name, tokens, offsets, row_ids, bucket_offsets)
         return int(offsets[-1]), bucket_offsets
+
+    @staticmethod
+    def _concatenate_row_ids(parts: list[RowIds]) -> RowIds:
+        if parts:
+            return numpy.concatenate(parts)
+
+        return numpy.empty(0, dtype=numpy.int64)
 
     @staticmethod
     def _concatenate(documents: list[TokenArray]) -> tuple[TokenArray, Offsets]:
@@ -267,23 +323,32 @@ class FragmentTokenizer:
 
         return tokens, offsets
 
-    def _iter_texts(self, fragment_id: int) -> Iterator[list[str]]:
+    def _iter_texts(self, fragment_id: int) -> Iterator[tuple[list[str], RowIds]]:
+        """
+        Kept texts and their Lance row addresses. _rowaddr, not a count of rows read:
+        a fragment with deleted rows skips their addresses
+        """
         fragment = self.dataset.get_fragment(fragment_id)
 
         if fragment is None:
             raise ValueError(f"fragment {fragment_id} does not exist")
 
         for batch in fragment.to_batches(
-            columns=["id", "text"], batch_size=self.batch_size
+            columns=["id", "text"], batch_size=self.batch_size, with_row_address=True
         ):
             document_ids = batch.column("id").to_pylist()
             texts = batch.column("text").to_pylist()
+            row_addresses = batch.column("_rowaddr").to_numpy().astype(numpy.int64)
 
-            yield [
-                text
+            keep = [
+                bool(text) and document_id not in self.exclude_ids
                 for document_id, text in zip(document_ids, texts, strict=True)
-                if text and document_id not in self.exclude_ids
             ]
+
+            yield (
+                [text for text, kept in zip(texts, keep, strict=True) if kept],
+                row_addresses[numpy.asarray(keep, dtype=bool)],
+            )
 
     def _encode(self, texts: list[str]) -> list[TokenArray]:
         # add_special_tokens=False because we will add them later
@@ -331,6 +396,7 @@ class BucketGatherer:
 
         token_parts: list[TokenArray] = []
         length_parts: list[Offsets] = []
+        row_id_parts: list[RowIds] = []
 
         for fragment_name, row in zip(
             self.fragment_names, self.bucket_offsets, strict=True
@@ -350,16 +416,22 @@ class BucketGatherer:
                 )
             )
             length_parts.append(numpy.diff(offsets))
+            # The same document range, so row ids stay aligned with the documents
+            row_id_parts.append(
+                self.fragment_store.read_row_ids_slice(fragment_name, start, stop)
+            )
 
         if token_parts:
             tokens = numpy.concatenate(token_parts)
             lengths = numpy.concatenate(length_parts)
+            row_ids = numpy.concatenate(row_id_parts)
         else:
             tokens = numpy.empty(0, dtype=numpy.int32)
             lengths = numpy.empty(0, dtype=numpy.int64)
+            row_ids = numpy.empty(0, dtype=numpy.int64)
 
         offsets = numpy.zeros(lengths.size + 1, dtype=numpy.int64)
         numpy.cumsum(lengths, out=offsets[1:])
 
-        self.store.write_shard(name, tokens, offsets)
+        self.store.write_shard(name, tokens, offsets, row_ids)
         return int(offsets[-1])
