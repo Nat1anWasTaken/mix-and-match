@@ -15,13 +15,14 @@ from src.loggers import ConsoleLogger, WandbLogger
 from src.loss import LinearCrossEntropySum
 from src.model import LlamaCausalLM, ScalingLlamaConfig
 from src.optimizer import build_muon_adamw, build_warmup_stable_decay
-from src.token_stream import TokenStream
-from src.tokenizer import ShardStore, load_tokenizer
+from src.recipe.recipe import load_recipe
+from src.token_stream import RecipeTokenStream
+from src.tokenizer import load_tokenizer
 from src.trainer import Trainer, TrainingConfig, barrier
 
 TOKENIZER_NAME = "meta-llama/Llama-3.2-1B"
 DEVELOPMENT_DATASET = "cerulean-works/fineweb-edu-dev"
-WANDB_PROJECT = "lab6-predictable-scaling"
+WANDB_PROJECT = "lab7-data-curation"
 VOCAB_SIZE = 128256
 
 
@@ -74,7 +75,9 @@ def parse_arguments() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    parser.add_argument("--data", required=True, help="shard store from prepare.py")
+    parser.add_argument(
+        "--recipe", required=True, help="compiled recipe directory from src/recipe/"
+    )
     parser.add_argument("--model-size", choices=MODEL_SIZES, required=True)
     parser.add_argument("--total-tokens", type=int, required=True)
     parser.add_argument("--seq-len", type=int, default=4096)
@@ -133,7 +136,12 @@ def parse_arguments() -> argparse.Namespace:
         required=True,
         help="names the wandb run and the checkpoint directory, so runs never overwrite",
     )
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="model init; the data order comes from the recipe's own seed",
+    )
     parser.add_argument("--tokenizer", default=TOKENIZER_NAME)
     parser.add_argument("--development-dataset", default=DEVELOPMENT_DATASET)
     parser.add_argument("--device", help="default: cuda, else mps, else cpu")
@@ -317,14 +325,24 @@ def main() -> None:
     loss_fn = LinearCrossEntropySum(
         chunk_tokens=arguments.ce_chunk_tokens, compile=arguments.compile
     )
+    recipe = load_recipe(arguments.recipe)
+
+    # Compilers add a small margin on top, since the ranks' shares vary a little and
+    # the packer drops each rank's last partial row
+    if recipe.total_tokens < arguments.total_tokens:
+        raise ValueError(
+            f"recipe {recipe.uri} holds {recipe.total_tokens:,} tokens, fewer than "
+            f"--total-tokens {arguments.total_tokens:,}"
+        )
+    if recipe.tokenizer != arguments.tokenizer:
+        raise ValueError(
+            f"recipe {recipe.uri} was tokenized with {recipe.tokenizer}, "
+            f"not {arguments.tokenizer}"
+        )
+
     # The stream shards documents across ranks before packing, so each rank only
     # packs its own 1/world_size
-    documents = TokenStream(
-        store=ShardStore(arguments.data),
-        seed=arguments.seed,
-        rank=rank,
-        world_size=world_size,
-    )
+    documents = RecipeTokenStream(recipe, rank=rank, world_size=world_size)
     rows = SequencePacker(documents, arguments.seq_len)
     train_data = PackedDataLoader(rows, arguments.micro_batch_size)
 
@@ -347,6 +365,12 @@ def main() -> None:
 
     run_config: dict[str, object] = {
         **vars(arguments),
+        "recipe_uri": recipe.uri,
+        "recipe_total_tokens": recipe.total_tokens,
+        "recipe_repeated_tokens": recipe.repeated_tokens,
+        "recipe_phases": [
+            {"name": phase.name, "tokens": phase.tokens} for phase in recipe.phases
+        ],
         "output_dir": str(arguments.output_dir),
         "model": model_config.to_dict(),
         "num_parameters": num_parameters,
@@ -396,6 +420,7 @@ def main() -> None:
         ckpt=checkpointer,
         logger=logger,
         cfg=training_config,
+        data_stats=documents.stats,
     )
 
     if resume_from is not None:
@@ -408,6 +433,19 @@ def main() -> None:
     trainer.train()
 
     if isinstance(logger, WandbLogger):
+        # The stream's counters run a few rows ahead of training, so the repeated share
+        # of the streamed tokens is applied to the trained ones
+        streamed = sum(
+            value
+            for key, value in trainer.data_metrics.items()
+            if key.startswith("tokens/")
+        )
+        repeated_share = (
+            trainer.data_metrics.get("repeated_tokens", 0.0) / streamed if streamed else 0.0
+        )
+        total_tokens = trainer.state.tokens_seen
+        logger.run.summary["total_tokens"] = total_tokens
+        logger.run.summary["oj_total_tokens"] = round(total_tokens * (1 - repeated_share))
         logger.finish()
 
     if torch.distributed.is_initialized():
