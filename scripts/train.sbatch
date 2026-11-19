@@ -4,7 +4,10 @@
 #   mkdir -p logs
 #   sbatch --job-name=150M-baseline scripts/train.sbatch \
 #       --recipe s3://mix-and-match/recipes/dolma-v1_7-30b --model-size 150M \
-#       --total-tokens 30001856512 --run-name 150M-baseline
+#       --total-tokens 30001856512 --eval paloma@val --run-name 150M-baseline
+#
+# --eval is required: the flock suite or task scored during training, by its registry
+# name, optionally on another split (paloma@val; plain paloma is the test split).
 #
 # --total-tokens must be a multiple of --global-batch-tokens (4,194,304 by default),
 # so "30B" is 7153 steps = 30,001,856,512 tokens.

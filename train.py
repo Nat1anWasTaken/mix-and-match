@@ -10,7 +10,7 @@ import torch
 
 from src.checkpoint import PretrainedCheckpointer
 from src.data import PackedDataLoader, SequencePacker
-from src.evaluation import DevelopmentEvaluator, load_development_texts
+from src.evaluation import FlockEvaluator, parse_eval_spec
 from src.loggers import ConsoleLogger, WandbLogger
 from src.loss import LinearCrossEntropySum
 from src.model import LlamaCausalLM, ScalingLlamaConfig
@@ -18,10 +18,9 @@ from src.optimizer import build_muon_adamw, build_warmup_stable_decay
 from src.recipe.recipe import load_recipe
 from src.token_stream import RecipeTokenStream
 from src.tokenizer import load_tokenizer
-from src.trainer import Trainer, TrainingConfig, barrier
+from src.trainer import Trainer, TrainingConfig
 
 TOKENIZER_NAME = "meta-llama/Llama-3.2-1B"
-DEVELOPMENT_DATASET = "cerulean-works/fineweb-edu-dev"
 WANDB_PROJECT = "lab7-data-curation"
 VOCAB_SIZE = 128256
 
@@ -120,7 +119,20 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--eval-every-steps", type=int, help="default: every 10%% of training"
     )
-    parser.add_argument("--eval-max-batches", type=int, help="default: whole dev set")
+    parser.add_argument(
+        "--eval",
+        action="append",
+        default=[],
+        metavar="NAME[@SPLIT]",
+        help="required, repeatable: a flock suite or task to score at every eval, by its "
+        "flock.eval.tasks registry name (as `flock eval run --suite/--task` takes it), "
+        "on its own split or on SPLIT, e.g. --eval paloma@val or --eval paloma (test)",
+    )
+    parser.add_argument(
+        "--eval-limit",
+        type=int,
+        help="score only each task's first N docs, for debug runs (default: all)",
+    )
     parser.add_argument(
         "--ckpt-every-steps", type=int, help="default: about every 5%% of training"
     )
@@ -143,7 +155,6 @@ def parse_arguments() -> argparse.Namespace:
         help="model init; the data order comes from the recipe's own seed",
     )
     parser.add_argument("--tokenizer", default=TOKENIZER_NAME)
-    parser.add_argument("--development-dataset", default=DEVELOPMENT_DATASET)
     parser.add_argument("--device", help="default: cuda, else mps, else cpu")
     parser.add_argument(
         "--compile",
@@ -165,7 +176,24 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
 
-    return parser.parse_args()
+    arguments = parser.parse_args()
+
+    # No default: which eval a run is judged by is a choice each run makes
+    if not arguments.eval:
+        parser.error(
+            "--eval is required: name the flock suite or task to score during training, "
+            "e.g. --eval paloma@val (Paloma's val split) or --eval paloma (its test "
+            "split, what `flock eval run --suite paloma` scores)"
+        )
+    for text in arguments.eval:
+        try:
+            parse_eval_spec(text)
+        except ValueError as error:
+            parser.error(str(error))
+    if arguments.eval_limit is not None and arguments.eval_limit < 1:
+        parser.error("--eval-limit must be at least 1")
+
+    return arguments
 
 
 def default_ckpt_every_steps(total_steps: int, log_every_steps: int) -> int:
@@ -317,8 +345,10 @@ def main() -> None:
             8, 2 * model_config.num_hidden_layers + 4
         )
         training_model.compile()
-        # eval runs on the unwrapped model, which the DDP compile above
-        # doesn't cover. Compile it too, so eval uses the same kernels as on 1 GPU
+        # The unwrapped model, which the DDP compile above doesn't cover, was compiled for
+        # eval. Eval no longer goes through it (TrainingScorer calls model.forward,
+        # uncompiled), but DDP's forward calls the module, so it is left as it was rather
+        # than risk changing how training traces
         if training_model is not model:
             model.compile()
 
@@ -346,19 +376,14 @@ def main() -> None:
     rows = SequencePacker(documents, arguments.seq_len)
     train_data = PackedDataLoader(rows, arguments.micro_batch_size)
 
-    # Every rank evaluates its share of the dev set, so every rank needs an evaluator:
-    # a rank without one would skip the eval all-reduce and hang the others.
-    # Rank 0 downloads the dev set first, so the other ranks read it from the HF cache
-    if rank == 0:
-        load_development_texts(arguments.development_dataset)
-    barrier()
-    evaluator = DevelopmentEvaluator(
+    # Every rank scores its share of the eval tasks, so every rank needs an evaluator:
+    # a rank without one would skip the eval gather and hang the others
+    evaluator = FlockEvaluator(
+        [parse_eval_spec(text) for text in arguments.eval],
+        model,
         tokenizer,
-        arguments.development_dataset,
-        loss_fn,
-        seq_len=arguments.seq_len,
-        micro_batch_size=arguments.micro_batch_size,
-        max_batches=arguments.eval_max_batches,
+        max_length=arguments.seq_len,
+        limit=arguments.eval_limit,
         rank=rank,
         world_size=world_size,
     )
