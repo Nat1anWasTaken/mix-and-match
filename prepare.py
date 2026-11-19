@@ -21,10 +21,22 @@ TokenStream then permutes the documents inside each shard. Uniform buckets plus 
 uniform permutation inside each bucket make the whole document order uniformly random,
 so any prefix of the shards is a uniform sample of the data.
 
-Rerunning with the same --output skips finished fragments and shards, so an interrupted
-run (or an expired S3 key) only needs a rerun with the same --fragments. The bucket
-count comes from the budget, so a different budget needs a different --output and
---fragments. The --fragments directory can be deleted once manifest.json is written.
+Phase 1 works in chunks, not whole fragments: Dolma's fragments hold up to 2^20 rows
+and hundreds of millions of tokens, and a source may span fewer fragments than there
+are workers. Chunks are contiguous row ranges, sized so the candidate fragments split
+into about TASKS_PER_WORKER chunks per worker (see plan_chunks). The budget is still
+checked only once a fragment's last chunk is in, so the selected fragments are a
+prefix of the shuffled order, as before. Bucket draws are per row of the fragment, so
+the output shards do not depend on the chunking, i.e. on --workers. Workers report the
+tokens they encode as they go, and the run logs tokenizing progress every
+PROGRESS_SECONDS, not only when a fragment finishes.
+
+Rerunning with the same --output skips finished chunks and shards, so an interrupted
+run (or an expired S3 key) only needs a rerun with the same --fragments. Chunks are
+reused only with the same --workers (it sets their ranges; others are retokenized). The
+bucket count comes from the budget, so a different budget needs a different --output
+and --fragments. The --fragments directory can be deleted once manifest.json is
+written.
 
 On hosts whose compute nodes have no internet (Forerunner1), split it into stages with
 the same arguments (scripts/submit-f1.sh runs all three):
@@ -50,8 +62,9 @@ import itertools
 import math
 import multiprocessing
 import os
+import queue
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy
@@ -66,7 +79,8 @@ from src.tokenizer import (
     FragmentTokenizer,
     Offsets,
     ShardStore,
-    fragment_shard_name,
+    chunk_ranges,
+    chunk_shard_name,
     load_development_ids,
     load_tokenizer,
     open_dataset,
@@ -81,7 +95,9 @@ SHARD_FORMAT = (
     "data/<shard>/: [BOS, text, EOS] int32 tokens.npy + int64 offsets.npy + "
     "int64 row_ids.npy (Lance _rowaddr), globally shuffled into buckets"
 )
-LAYOUT_VERSION = 2
+# 3: phase 1 in chunks, bucket draws per row of the fragment (2 drew them per kept
+# document), so a layout 2 fragment store can't be continued
+LAYOUT_VERSION = 3
 WANDB_PROJECT = "lab7-data-curation"
 # FineWeb-Edu's per-document GPT-2 token count, which --stage fetch sizes the mirror by.
 # Sources without it (Dolma) are sized from a sample of their text instead
@@ -95,10 +111,20 @@ SAMPLE_SLICES = 16
 SAMPLE_SLICE_ROWS = 16
 CALIBRATION_FRAGMENTS = 8
 CALIBRATION_CHARACTERS = 8_000_000
+# Phase 1 chunks per worker: more balance the load better (a fragment waits for its
+# last chunk), fewer cost less per-task overhead and fewer files for phase 2 to read
+TASKS_PER_WORKER = 4
+# How often phase 1 logs the tokens workers have encoded, between finished fragments
+PROGRESS_SECONDS = 30
 
 # One per worker process, built by initialize_tokenizer or initialize_gatherer
 tokenizer_worker: FragmentTokenizer | None = None
 gatherer_worker: BucketGatherer | None = None
+# Where tokenizer workers put the tokens of each piece they encode, for progress
+progress_queue: "multiprocessing.Queue[int] | None" = None
+
+# A phase 1 task: (fragment_id, offset, limit, rows of the fragment)
+type Chunk = tuple[int, int, int, int]
 
 
 def initialize_tokenizer(
@@ -110,8 +136,9 @@ def initialize_tokenizer(
     seed: int,
     num_buckets: int,
     batch_size: int,
+    progress: "multiprocessing.Queue[int]",
 ) -> None:
-    global tokenizer_worker
+    global tokenizer_worker, progress_queue
 
     # Each process already uses one core; tokenizer threads on top would oversubscribe
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -125,13 +152,17 @@ def initialize_tokenizer(
         num_buckets,
         batch_size,
     )
+    progress_queue = progress
 
 
-def tokenize_fragment(fragment_id: int) -> tuple[int, int, Offsets]:
-    if tokenizer_worker is None:
+def tokenize_chunk(chunk: Chunk) -> tuple[int, Offsets]:
+    if tokenizer_worker is None or progress_queue is None:
         raise RuntimeError("worker is not initialized")
 
-    return fragment_id, *tokenizer_worker.tokenize_fragment(fragment_id)
+    fragment_id, offset, limit, rows = chunk
+    return tokenizer_worker.tokenize_chunk(
+        fragment_id, offset, limit, rows, progress=progress_queue.put
+    )
 
 
 def initialize_gatherer(
@@ -143,7 +174,10 @@ def initialize_gatherer(
     global gatherer_worker
 
     gatherer_worker = BucketGatherer(
-        ShardStore(fragments_uri), ShardStore(output_uri), fragment_names, bucket_offsets
+        ShardStore(fragments_uri),
+        ShardStore(output_uri),
+        fragment_names,
+        bucket_offsets,
     )
 
 
@@ -294,6 +328,30 @@ def estimate_tokens(
         else 0.0
     )
     return int(rows * float(row_tokens.mean())), variance
+
+
+def plan_chunks(
+    fragment_rows: Sequence[tuple[int, int]], workers: int
+) -> list[tuple[int, list[Chunk]]]:
+    """
+    Every fragment's chunks, as (fragment_id, [(fragment_id, offset, limit, rows), ...])
+    in fragment order. The chunk size comes from all the candidate fragments' rows, so
+    they split into about TASKS_PER_WORKER chunks per worker. Process's candidates are
+    the mirrored fragments, about --mirror-margin x the budget; --stage all has every
+    fragment of the source as a candidate, so its chunks can be whole fragments
+    """
+    total = sum(rows for _, rows in fragment_rows)
+    chunk_rows = max(math.ceil(total / (workers * TASKS_PER_WORKER)), 1)
+    return [
+        (
+            fragment_id,
+            [
+                (fragment_id, offset, limit, rows)
+                for offset, limit in chunk_ranges(rows, chunk_rows)
+            ],
+        )
+        for fragment_id, rows in fragment_rows
+    ]
 
 
 def select_fragments(
@@ -491,14 +549,65 @@ def process(arguments: argparse.Namespace) -> None:
         mirror_ran_out = len(mirrored) < len(fragment_ids)
         fragment_ids = mirrored
 
+    fragment_rows = []
+
+    for fragment_id in fragment_ids:
+        fragment = dataset.get_fragment(fragment_id)
+
+        if fragment is None:
+            raise ValueError(f"fragment {fragment_id} does not exist")
+
+        # From the fragment's metadata, no data read. Rows after deletions, which
+        # to_batches' offset and limit index into
+        fragment_rows.append((fragment_id, fragment.count_rows()))
+
+    plan = plan_chunks(fragment_rows, arguments.workers)
+    print(
+        f"phase 1: {len(plan)} candidate fragments in "
+        f"{sum(len(chunks) for _, chunks in plan)} chunks",
+        flush=True,
+    )
+
     fragments: list[dict[str, int]] = []
+    chunk_names: list[str] = []
     bucket_offsets: list[Offsets] = []
     total_tokens = 0
+    # Tokens the workers have encoded so far, from progress messages: also counts
+    # chunks still in flight, and chunks past the budget that end up unused
+    encoded_tokens = 0
+    step = 0
     start_time = time.monotonic()
+    last_log_time = start_time
 
     # spawn, not fork: this process already runs Lance's background threads, and
     # forking a process with live threads can deadlock the child
     context = multiprocessing.get_context("spawn")
+    progress: multiprocessing.Queue[int] = context.Queue()
+
+    def log_phase_1(metrics: dict[str, float]) -> None:
+        nonlocal encoded_tokens, step, last_log_time
+
+        while True:
+            try:
+                encoded_tokens += progress.get_nowait()
+            except queue.Empty:
+                break
+
+        now = time.monotonic()
+        elapsed = now - start_time
+        step += 1
+        last_log_time = now
+        logger.log(
+            {
+                **metrics,
+                "prepare/encoded_tokens": encoded_tokens,
+                "prepare/encoded_tokens_per_second": encoded_tokens / elapsed,
+                "prepare/total_tokens": total_tokens,
+                "prepare/budget_fraction": total_tokens / arguments.token_budget,
+                "prepare/tokens_per_second": total_tokens / elapsed,
+            },
+            step=step,
+        )
 
     # Phase 1: tokenize and scatter
     with context.Pool(
@@ -513,37 +622,54 @@ def process(arguments: argparse.Namespace) -> None:
             arguments.seed,
             num_buckets,
             arguments.batch_size,
+            progress,
         ),
     ) as pool:
-        # imap yields in fragment_ids order however the workers finish, so the
-        # selected fragments are always the same prefix of the shuffled order
-        for fragment_id, tokens, offsets in pool.imap(tokenize_fragment, fragment_ids):
-            fragments.append({"fragment_id": fragment_id, "tokens": tokens})
-            bucket_offsets.append(offsets)
-            total_tokens += tokens
+        # imap yields in chunk order, fragment by fragment, however the workers
+        # finish. The budget is checked at fragment ends only, so the selected
+        # fragments are always the same prefix of the shuffled order
+        results = pool.imap(
+            tokenize_chunk, [chunk for _, chunks in plan for chunk in chunks]
+        )
 
-            elapsed = time.monotonic() - start_time
-            logger.log(
+        for fragment_id, chunks in plan:
+            fragment_tokens = 0
+
+            for chunk in chunks:
+                # Waits for the chunk, logging progress every PROGRESS_SECONDS
+                while True:
+                    timeout = last_log_time + PROGRESS_SECONDS - time.monotonic()
+
+                    try:
+                        tokens, offsets = results.next(timeout=max(timeout, 0))
+                        break
+                    except multiprocessing.TimeoutError:
+                        log_phase_1({})
+
+                fragment_tokens += tokens
+                chunk_names.append(chunk_shard_name(*chunk[:3]))
+                bucket_offsets.append(offsets)
+
+            fragments.append({"fragment_id": fragment_id, "tokens": fragment_tokens})
+            total_tokens += fragment_tokens
+            log_phase_1(
                 {
                     "prepare/fragment_id": fragment_id,
-                    "prepare/fragment_tokens": tokens,
-                    "prepare/total_tokens": total_tokens,
-                    "prepare/budget_fraction": total_tokens / arguments.token_budget,
-                    "prepare/tokens_per_second": total_tokens / elapsed,
-                },
-                step=len(fragments),
+                    "prepare/fragment_tokens": fragment_tokens,
+                }
             )
 
             if total_tokens >= arguments.token_budget:
                 break
 
-        # Leaving the with block terminates workers still busy on later fragments.
+        # Leaving the with block terminates workers still busy on later chunks.
         # Their shards never got offsets.npy, so a rerun redoes them
 
     if total_tokens < arguments.token_budget:
         if mirror_ran_out:
-            # Phase 2 needs the final fragment list, so stop before it. The tokenized
-            # fragments are kept, and the rerun only tokenizes the new ones
+            # Phase 2 needs the final fragment list, so stop before it. A larger
+            # mirror has more candidate rows, hence other chunk ranges (plan_chunks),
+            # so the rerun tokenizes everything again
             raise RuntimeError(
                 f"the mirror ran out at {total_tokens:,} of {arguments.token_budget:,} "
                 f"tokens after {len(fragments)} fragments; rerun --stage fetch with a "
@@ -556,14 +682,15 @@ def process(arguments: argparse.Namespace) -> None:
     gathered_tokens = 0
     start_time = time.monotonic()
 
-    # Phase 2: gather each bucket into an output shard
+    # Phase 2: gather each bucket into an output shard, from the selected fragments'
+    # chunks in phase 1 order, so a bucket's documents keep (fragment, row) order
     with context.Pool(
         arguments.workers,
         initializer=initialize_gatherer,
         initargs=(
             fragment_store.uri,
             store.uri,
-            [fragment_shard_name(fragment["fragment_id"]) for fragment in fragments],
+            chunk_names,
             numpy.stack(bucket_offsets),
         ),
     ) as pool:
@@ -572,6 +699,8 @@ def process(arguments: argparse.Namespace) -> None:
             gathered_tokens += tokens
 
             elapsed = time.monotonic() - start_time
+            # Continues phase 1's steps
+            step += 1
             logger.log(
                 {
                     "prepare/shard_tokens": tokens,
@@ -579,7 +708,7 @@ def process(arguments: argparse.Namespace) -> None:
                     "prepare/gathered_fraction": gathered_tokens / total_tokens,
                     "prepare/gather_tokens_per_second": gathered_tokens / elapsed,
                 },
-                step=len(fragments) + len(shards),
+                step=step,
             )
 
     # Every document lands in exactly one bucket
@@ -603,6 +732,7 @@ def process(arguments: argparse.Namespace) -> None:
     if isinstance(logger, WandbLogger):
         logger.run.summary["total_tokens"] = total_tokens
         logger.run.summary["num_fragments"] = len(fragments)
+        logger.run.summary["num_chunks"] = len(chunk_names)
         logger.run.summary["num_shards"] = len(shards)
         logger.run.summary["ran_out"] = total_tokens < arguments.token_budget
         logger.finish()

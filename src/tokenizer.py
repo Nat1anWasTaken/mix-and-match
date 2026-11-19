@@ -1,7 +1,9 @@
 import io
+import itertools
 import json
+import math
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path, PurePosixPath
 
 import lance
@@ -207,12 +209,27 @@ class ShardStore:
         return numpy.frombuffer(data, dtype=dtype)
 
 
-def fragment_shard_name(fragment_id: int) -> str:
+def chunk_shard_name(fragment_id: int, offset: int, limit: int) -> str:
     """
-    Where phase 1 of the global shuffle puts a tokenized fragment inside the fragment
-    store, which is kept apart from the output shards that TokenStream reads
+    Where phase 1 of the global shuffle puts a tokenized chunk, rows [offset, offset +
+    limit) of a fragment, inside the fragment store, which is kept apart from the
+    output shards that TokenStream reads. The range is part of the name, so a rerun
+    that cuts the fragments differently never reuses a chunk of another range
     """
-    return f"{fragment_id:06d}"
+    return f"{fragment_id:06d}-{offset:07d}-{limit:07d}"
+
+
+def chunk_ranges(rows: int, chunk_rows: int) -> list[tuple[int, int]]:
+    """
+    (offset, limit) of the chunks of a fragment of rows rows: as few as keep each within
+    chunk_rows, all about the same size, so none is a tiny remainder
+    """
+    if rows == 0:
+        return []
+
+    chunks = math.ceil(rows / chunk_rows)
+    bounds = [chunk * rows // chunks for chunk in range(chunks + 1)]
+    return [(start, stop - start) for start, stop in itertools.pairwise(bounds)]
 
 
 def load_tokenizer(name: str) -> PreTrainedTokenizerFast:
@@ -262,11 +279,17 @@ def shuffled_fragment_ids(dataset: LanceDataset, seed: int) -> list[int]:
     return random_generator.permutation(fragment_ids).tolist()
 
 
+# Phase 1 encodes a batch's texts in pieces of about this many characters, and reports
+# progress after each: about a million Llama 3 tokens, some tens of seconds of one
+# worker. A piece is never split inside a document, so one long one can exceed it
+ENCODE_CHARACTERS = 4_000_000
+
+
 class FragmentTokenizer:
     """
-    Phase 1 of the global shuffle: tokenizes a fragment and scatters its documents into
-    buckets. Documents are stored sorted by bucket, so each bucket is one contiguous
-    range that phase 2 can read on its own
+    Phase 1 of the global shuffle: tokenizes a chunk of a fragment (a range of its
+    rows) and scatters its documents into buckets. Documents are stored sorted by
+    bucket, so each bucket is one contiguous range that phase 2 can read on its own
     """
 
     def __init__(
@@ -293,30 +316,67 @@ class FragmentTokenizer:
         self.num_buckets = num_buckets
         self.batch_size = batch_size
 
-    def tokenize_fragment(self, fragment_id: int) -> tuple[int, Offsets]:
+    def tokenize_chunk(
+        self,
+        fragment_id: int,
+        offset: int,
+        limit: int,
+        rows: int,
+        progress: Callable[[int], None] | None = None,
+    ) -> tuple[int, Offsets]:
         """
-        Returns the fragment's token count and its bucket_offsets: bucket b holds
-        documents [bucket_offsets[b], bucket_offsets[b + 1])
+        Rows [offset, offset + limit) of a fragment of rows rows (its count_rows(),
+        after deletions). Returns the chunk's token count and its bucket_offsets:
+        bucket b holds documents [bucket_offsets[b], bucket_offsets[b + 1]). progress
+        is called with the tokens of each piece as it is encoded (all at once for a
+        chunk tokenized by an earlier run)
         """
-        name = fragment_shard_name(fragment_id)
+        name = chunk_shard_name(fragment_id, offset, limit)
 
         if self.store.has_shard(name):
-            return (
-                int(self.store.read_offsets(name)[-1]),
-                self.store.read_bucket_offsets(name),
-            )
+            tokens = int(self.store.read_offsets(name)[-1])
+
+            if progress is not None:
+                progress(tokens)
+
+            return tokens, self.store.read_bucket_offsets(name)
+
+        # Every row of the fragment draws its bucket independently and uniformly, and a
+        # chunk takes its rows' draws by position. The draws depend only on (seed,
+        # fragment_id), not on how the fragment is cut into chunks or which worker
+        # runs them, so the output shards are the same for any --workers
+        random_generator = numpy.random.default_rng([self.seed, 0, fragment_id])
+        row_buckets = random_generator.integers(self.num_buckets, size=rows)[
+            offset : offset + limit
+        ]
 
         documents: list[TokenArray] = []
         row_id_parts: list[RowIds] = []
+        bucket_parts: list[numpy.ndarray] = []
+        position = 0
 
-        for texts, row_ids in self._iter_texts(fragment_id):
-            documents.extend(self._encode(texts))
+        for texts, row_ids, keep in self._iter_texts(fragment_id, offset, limit):
+            for piece in self._pieces(texts):
+                encoded = self._encode(piece)
+                documents.extend(encoded)
+
+                if progress is not None:
+                    progress(sum(document.size for document in encoded))
+
             row_id_parts.append(row_ids)
+            bucket_parts.append(row_buckets[position : position + keep.size][keep])
+            position += keep.size
 
-        # Every document draws its bucket independently and uniformly. The draws depend
-        # only on (seed, fragment_id), not on which worker runs it or when
-        random_generator = numpy.random.default_rng([self.seed, 0, fragment_id])
-        buckets = random_generator.integers(self.num_buckets, size=len(documents))
+        # Bucket draws line up with rows only if the scan returns exactly the range
+        if position != limit:
+            raise ValueError(
+                f"fragment {fragment_id} rows {offset}+{limit} returned {position} rows"
+            )
+
+        if bucket_parts:
+            buckets = numpy.concatenate(bucket_parts)
+        else:
+            buckets = numpy.empty(0, dtype=numpy.int64)
 
         order = numpy.argsort(buckets, kind="stable")
         documents = [documents[i] for i in order]
@@ -360,10 +420,14 @@ class FragmentTokenizer:
 
         return tokens, offsets
 
-    def _iter_texts(self, fragment_id: int) -> Iterator[tuple[list[str], RowIds]]:
+    def _iter_texts(
+        self, fragment_id: int, offset: int, limit: int
+    ) -> Iterator[tuple[list[str], RowIds, numpy.ndarray]]:
         """
-        Kept texts and their Lance row addresses. _rowaddr, not a count of rows read:
-        a fragment with deleted rows skips their addresses
+        Per batch of rows [offset, offset + limit): the kept texts, their Lance row
+        addresses, and which of the batch's rows were kept. _rowaddr, not a count of
+        rows read: a fragment with deleted rows skips their addresses. offset and limit
+        count rows after deletions, like count_rows()
         """
         fragment = self.dataset.get_fragment(fragment_id)
 
@@ -371,21 +435,50 @@ class FragmentTokenizer:
             raise ValueError(f"fragment {fragment_id} does not exist")
 
         for batch in fragment.to_batches(
-            columns=["id", "text"], batch_size=self.batch_size, with_row_address=True
+            columns=["id", "text"],
+            batch_size=self.batch_size,
+            offset=offset,
+            limit=limit,
+            with_row_address=True,
         ):
             document_ids = batch.column("id").to_pylist()
             texts = batch.column("text").to_pylist()
             row_addresses = batch.column("_rowaddr").to_numpy().astype(numpy.int64)
 
-            keep = [
-                bool(text) and document_id not in self.exclude_ids
-                for document_id, text in zip(document_ids, texts, strict=True)
-            ]
+            keep = numpy.array(
+                [
+                    bool(text) and document_id not in self.exclude_ids
+                    for document_id, text in zip(document_ids, texts, strict=True)
+                ],
+                dtype=bool,
+            )
 
             yield (
                 [text for text, kept in zip(texts, keep, strict=True) if kept],
-                row_addresses[numpy.asarray(keep, dtype=bool)],
+                row_addresses[keep],
+                keep,
             )
+
+    @staticmethod
+    def _pieces(texts: list[str]) -> Iterator[list[str]]:
+        """
+        texts in consecutive runs of about ENCODE_CHARACTERS characters. Each text is
+        encoded on its own either way, so the pieces never change the tokens
+        """
+        piece: list[str] = []
+        characters = 0
+
+        for text in texts:
+            piece.append(text)
+            characters += len(text)
+
+            if characters >= ENCODE_CHARACTERS:
+                yield piece
+                piece = []
+                characters = 0
+
+        if piece:
+            yield piece
 
     def _encode(self, texts: list[str]) -> list[TokenArray]:
         # add_special_tokens=False because we will add them later
