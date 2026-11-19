@@ -31,7 +31,9 @@ the same arguments (scripts/submit-f1.sh runs all three):
 
     --stage fetch     login node: caches the tokenizer and development ids, and copies
                       the first fragments of the shuffled order into --mirror, until
-                      their source token_count reaches --mirror-margin x the budget
+                      their estimated tokens reach --mirror-margin x the budget. The
+                      estimate is the source's token_count column if it has one (FineWeb-
+                      Edu), else the data files' size / --bytes-per-token (Dolma)
     --stage process   compute node: the two phases above, reading --mirror and writing a
                       local --output, offline
     --stage upload    login node: copies the local --output to --remote
@@ -64,6 +66,7 @@ from src.tokenizer import (
     load_development_ids,
     load_tokenizer,
     open_dataset,
+    open_filesystem,
     shuffled_fragment_ids,
 )
 
@@ -77,7 +80,8 @@ SHARD_FORMAT = (
 )
 LAYOUT_VERSION = 2
 WANDB_PROJECT = "lab7-data-curation"
-# FineWeb-Edu's per-document GPT-2 token count, which --stage fetch sizes the mirror by
+# FineWeb-Edu's per-document GPT-2 token count, which --stage fetch sizes the mirror by.
+# Sources without it (Dolma) are sized by file size and --bytes-per-token instead
 TOKEN_COUNT_COLUMN = "token_count"
 
 # One per worker process, built by initialize_tokenizer or initialize_gatherer
@@ -185,8 +189,16 @@ def parse_arguments() -> argparse.Namespace:
         "--mirror-margin",
         type=float,
         default=1.25,
-        help="--stage fetch mirrors source token_count up to this x --token-budget. "
+        help="--stage fetch mirrors estimated tokens up to this x --token-budget. "
         "token_count is GPT-2's, which runs above Llama 3's",
+    )
+    parser.add_argument(
+        "--bytes-per-token",
+        type=float,
+        help="--stage fetch estimates a fragment's tokens as its data files' size over "
+        "this; required for sources without a token_count column. On-disk Lance bytes "
+        "per token vary by source (about 1 for code, 2-3 for web text), so set it per "
+        "source; a smaller value mirrors more",
     )
     return parser.parse_args()
 
@@ -204,12 +216,19 @@ def main() -> None:
 
 
 def select_fragments(
-    dataset: LanceDataset, fragment_ids: list[int], target_tokens: float, workers: int
+    dataset: LanceDataset,
+    fragment_ids: list[int],
+    target_tokens: float,
+    workers: int,
+    bytes_per_token: float | None = None,
 ) -> tuple[list[int], int]:
     """
-    The shortest prefix of fragment_ids whose source token_count reaches target_tokens,
-    and that count. Reads only the token_count column, a chunk of fragments at a time
+    The shortest prefix of fragment_ids whose estimated tokens reach target_tokens, and
+    that estimate, a chunk of fragments at a time. Without bytes_per_token it reads only
+    the token_count column; with it, only the fragments' file sizes from the manifest
     """
+    filesystem, root = open_filesystem(dataset.uri)
+    root = root.rstrip("/")
 
     def count(fragment_id: int) -> int:
         fragment = dataset.get_fragment(fragment_id)
@@ -217,9 +236,25 @@ def select_fragments(
         if fragment is None:
             raise ValueError(f"fragment {fragment_id} does not exist")
 
-        column = fragment.to_table(columns=[TOKEN_COUNT_COLUMN]).column(0)
-        # nansum: a column with nulls comes out as float with NaN for them
-        return int(numpy.nansum(column.to_numpy(zero_copy_only=False)))
+        if bytes_per_token is None:
+            column = fragment.to_table(columns=[TOKEN_COUNT_COLUMN]).column(0)
+            # nansum: a column with nulls comes out as float with NaN for them
+            return int(numpy.nansum(column.to_numpy(zero_copy_only=False)))
+
+        size = 0
+
+        for data_file in fragment.metadata.files:
+            file_size = data_file.file_size_bytes
+
+            # Older manifests don't record it; ask the store, as fetch_fragments does
+            if file_size is None:
+                file_size = filesystem.get_file_info(
+                    f"{root}/data/{data_file.path}"
+                ).size
+
+            size += file_size
+
+        return int(size / bytes_per_token)
 
     selected: list[int] = []
     total = 0
@@ -249,6 +284,17 @@ def fetch(arguments: argparse.Namespace) -> None:
         arguments.dataset, existing.version if existing is not None else None
     )
 
+    bytes_per_token = arguments.bytes_per_token
+
+    if bytes_per_token is not None and not bytes_per_token > 0:
+        raise ValueError(f"--bytes-per-token must be positive, not {bytes_per_token}")
+
+    if bytes_per_token is None and TOKEN_COUNT_COLUMN not in dataset.schema.names:
+        raise ValueError(
+            f"{arguments.dataset} has no {TOKEN_COUNT_COLUMN} column to size the "
+            "mirror by; pass --bytes-per-token to size it by file size"
+        )
+
     load_tokenizer(arguments.tokenizer)
     load_development_ids(arguments.development_dataset, DEVELOPMENT_SIZE)
 
@@ -259,10 +305,16 @@ def fetch(arguments: argparse.Namespace) -> None:
         fragment_ids,
         arguments.token_budget * arguments.mirror_margin,
         workers,
+        bytes_per_token,
+    )
+    estimate = (
+        TOKEN_COUNT_COLUMN
+        if bytes_per_token is None
+        else f"file size / {bytes_per_token} bytes per token"
     )
     print(
         f"{len(selected)} of {len(fragment_ids)} fragments hold {source_tokens:,} "
-        f"source tokens, {arguments.mirror_margin}x the budget",
+        f"estimated tokens ({estimate}), {arguments.mirror_margin}x the budget",
         flush=True,
     )
 
