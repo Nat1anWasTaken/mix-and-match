@@ -57,5 +57,9 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 # One task per node; torchrun forks a rank per GPU and sets RANK/LOCAL_RANK/WORLD_SIZE,
 # which train.py's setup_distributed reads. With one GPU it runs a single rank
 export PYTHONUNBUFFERED=1
+# NCCL's bootstrap otherwise picks the IPoIB interface (ibp*), where connecting to
+# the node's own address never completes, so init hangs with idle GPUs. --standalone
+# keeps every rank on this node, so loopback is enough
+export NCCL_SOCKET_IFNAME=lo
 srun uv run --frozen torchrun --standalone --nproc_per_node="$SLURM_GPUS_ON_NODE" \
     train.py "$@"
