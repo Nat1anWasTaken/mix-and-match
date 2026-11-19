@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import json
 import logging
 import math
 import os
@@ -143,6 +144,14 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="continue from the newest checkpoint in the run's checkpoint directory",
     )
+    parser.add_argument(
+        "--init-from",
+        type=Path,
+        help="start this new run from another run's checkpoint (a step-N directory): "
+        "model, optimizer, schedule step, data stream and tokens_seen all carry over, "
+        "under this run's own name. For WSD decay branches off a stable-phase checkpoint. "
+        "Once the run holds checkpoints of its own, --resume continues those instead",
+    )
 
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints"))
     parser.add_argument(
@@ -226,6 +235,46 @@ def pick_device(requested: str | None) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def scheduler_decay_start(total_steps: int, decay_fraction: float) -> int:
+    """The first step of the WSD decay, as build_warmup_stable_decay computes it"""
+    return total_steps - max(1, math.ceil(total_steps * decay_fraction))
+
+
+def check_branch_point(
+    checkpoint: Path, total_steps: int, tokens_per_step: int, decay_start: int
+) -> None:
+    """
+    Refuse an --init-from checkpoint this run's schedule can't continue smoothly.
+
+    The LR multiplier depends only on the step, so a checkpoint taken while the source
+    run's LR was constant (after warmup, before its decay) continues exactly as if this
+    run had been that long from the start, provided this run's decay starts at or after
+    the checkpoint's step: the multiplier is 1.0 up to decay_start either way
+    """
+    state_path = checkpoint / "trainer_state.json"
+    if not (checkpoint / "resume.pt").is_file() or not state_path.is_file():
+        raise FileNotFoundError(f"--init-from {checkpoint} is not a step-N checkpoint")
+
+    state = json.loads(state_path.read_text())
+    step, tokens_seen = state["step"], state["tokens_seen"]
+    if tokens_seen != step * tokens_per_step:
+        raise ValueError(
+            f"--init-from {checkpoint}: {tokens_seen:,} tokens in {step} steps is not "
+            f"{tokens_per_step:,} per step; use the source run's --global-batch-tokens"
+        )
+    if step >= total_steps:
+        raise ValueError(
+            f"--init-from {checkpoint} is at step {step}, not before this run's last "
+            f"step {total_steps}"
+        )
+    if step > decay_start:
+        raise ValueError(
+            f"--init-from {checkpoint} is at step {step}, after this run's decay starts "
+            f"(step {decay_start}): the LR would jump down at the branch. Lower "
+            "--decay-fraction or raise --total-tokens"
+        )
 
 
 def build_model_config(
@@ -443,6 +492,16 @@ def main() -> None:
             f"{run_dir} already holds {resume_from.name}; pass --resume to continue "
             "it, or pick a new --run-name"
         )
+    # A branch run starts from the other run's checkpoint only until it has its own
+    if resume_from is None and arguments.init_from is not None:
+        resume_from = arguments.init_from
+        check_branch_point(
+            resume_from,
+            total_steps,
+            tokens_per_step,
+            scheduler_decay_start(total_steps, arguments.decay_fraction),
+        )
+        run_config["init_from"] = str(resume_from)
 
     if arguments.no_wandb or rank != 0:
         logger: ConsoleLogger | WandbLogger = ConsoleLogger()
