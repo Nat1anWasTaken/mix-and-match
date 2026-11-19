@@ -22,8 +22,7 @@
 #      --remote it skips the upload; rerun with --stage upload by hand any time
 #
 # Extra sbatch options go in SBATCH_ARGS, e.g. SBATCH_ARGS="--partition=development
-# --time=08:00:00". Logging in to wandb (wandb login) and Hugging Face (hf auth login)
-# on the login node is up to you.
+# --time=08:00:00".
 
 set -euo pipefail
 
