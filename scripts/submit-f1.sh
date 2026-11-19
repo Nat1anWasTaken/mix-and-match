@@ -8,10 +8,11 @@
 #       --remote s3://<bucket>/sources/fineweb-edu-llama3 \
 #       --token-budget 30000000000 --run-name prepare-fineweb-edu-llama3
 #
-#   scripts/submit-f1.sh -m src.recipe.scorers.paloma \
+#   scripts/submit-f1.sh -m src.recipe.scorers.paloma_decontamination \
 #       --store /work1/$USER/stores/fineweb-edu-llama3 \
 #       --mirror /work1/$USER/mirrors/fineweb-edu \
-#       --remote s3://<bucket>/sources/fineweb-edu-llama3
+#       --remote s3://<bucket>/sources/fineweb-edu-llama3 \
+#       --run-name score-paloma_decontamination-fineweb-edu-llama3
 #
 # It runs:
 #   1. --stage fetch here, which downloads into --mirror and the Hugging Face cache

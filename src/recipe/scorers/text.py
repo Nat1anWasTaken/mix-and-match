@@ -1,37 +1,30 @@
 """
-A harness for scorers that read document text, like a fastText classifier or Paloma
-decontamination.
+The parallel text scan behind TextScorer (see harness.py), the counterpart of
+metadata.scan_columns for scorers that read document text, like a fastText classifier
+or Paloma decontamination.
 
-A scorer module defines a top-level factory that builds the model once per worker
-process and returns the scoring function:
+A scorer's factory builds the model once per worker process and returns the scoring
+function:
 
     def build() -> Callable[[list[str]], numpy.ndarray]:
         model = fasttext.load_model(...)
         return lambda texts: ...           # one value per text
 
-and calls score_texts(store, kind, build, info). Each worker scans whole Lance fragments
-in order, which is the fast way to read them; the scores are joined onto the shards
-through row_ids.npy afterwards.
+Each worker scans whole Lance fragments in order, which is the fast way to read them;
+the harness joins the scores onto the shards through row_ids.npy afterwards. Workers
+are processes, not threads: scoring text is Python and numpy work that holds the GIL.
 """
 
 import multiprocessing
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor
 
 import lance
 import numpy
 from lance import LanceDataset
 
-from ...tokenizer import RowIds, ShardStore
-from ..metadata import (
-    ensure_info,
-    is_complete,
-    join_onto_shards,
-    open_source_dataset,
-    source_dataset,
-    source_fragment_ids,
-)
+from ...tokenizer import RowIds
 
 type ScoreFunction = Callable[[list[str]], numpy.ndarray]
 type ScorerFactory = Callable[[], ScoreFunction]
@@ -87,31 +80,22 @@ def _score_fragment(fragment_id: int) -> tuple[RowIds, numpy.ndarray]:
     return numpy.concatenate(address_parts), numpy.concatenate(score_parts)
 
 
-def score_texts(
-    store: ShardStore,
-    kind: str,
+def scan_texts(
+    dataset: LanceDataset,
+    fragment_ids: Iterable[int],
     factory: ScorerFactory,
-    info: Mapping[str, object],
-    workers: int = os.cpu_count() or 1,
     batch_size: int = 1024,
-    mirror: str | None = None,
-) -> None:
+    workers: int = os.cpu_count() or 1,
+    on_fragment: Callable[[int], None] | None = None,
+) -> tuple[RowIds, numpy.ndarray]:
     """
-    Scores every row of the store's source fragments and writes meta/<kind>/. info
-    names the scorer and its settings; a different info needs a different kind. The
-    fragments are read from mirror if given
+    The row addresses and scores of every row of the given fragments, in scan order.
+    on_fragment is called on the main process with each fragment's row count, in
+    fragment order, as the fragments finish
     """
-    source, version = source_dataset(store)
-    ensure_info(store, kind, {**info, "dataset": source, "dataset_version": version})
-
-    if is_complete(store, kind):
-        print(f"{store.uri} already has every shard of meta/{kind}", flush=True)
-        return
-
-    dataset = open_source_dataset(store, mirror)
-
     # spawn, not fork: Lance runs background threads, and forking them can deadlock
     context = multiprocessing.get_context("spawn")
+    parts: list[tuple[RowIds, numpy.ndarray]] = []
 
     # ProcessPoolExecutor, not Pool: a Pool respawns workers whose initializer
     # failed forever and map never returns, while this raises BrokenProcessPool
@@ -121,9 +105,17 @@ def score_texts(
         initializer=_initialize,
         initargs=(dataset.uri, dataset.version, factory, batch_size),
     ) as pool:
-        parts = list(pool.map(_score_fragment, source_fragment_ids(store)))
+        # map yields in fragment_ids order however the workers finish
+        for part in pool.map(_score_fragment, fragment_ids):
+            parts.append(part)
 
-    addresses = numpy.concatenate([part[0] for part in parts])
-    scores = numpy.concatenate([part[1] for part in parts])
-    join_onto_shards(store, kind, addresses, scores)
-    print(f"wrote meta/{kind} for {store.uri}", flush=True)
+            if on_fragment is not None:
+                on_fragment(part[0].size)
+
+    if not parts:
+        return numpy.empty(0, dtype=numpy.int64), numpy.empty(0)
+
+    return (
+        numpy.concatenate([part[0] for part in parts]),
+        numpy.concatenate([part[1] for part in parts]),
+    )
