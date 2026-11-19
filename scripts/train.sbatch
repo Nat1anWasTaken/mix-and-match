@@ -7,8 +7,8 @@
 #       --total-tokens 30000000000 --run-name 150M-baseline --compile
 #
 # H200-hours = GPUs x wall time, so --time is what bounds the grant a run can use.
-# S3 keys last at most 8h, so --time must stay below that (default 7:30). Longer runs
-# are chained segments: sbatch --dependency=afterany:<prev> ... --resume
+# S3 keys come from the flock AWS profile, which renews them, so --time is not bound
+# by a key's lifetime. Set it up once on the cluster with `flock s3 configure`
 #SBATCH --job-name=train
 #SBATCH --account=ACD115198
 #SBATCH --partition=8gpus
@@ -32,27 +32,12 @@ export TOKENIZERS_PARALLELISM=false
 export TORCHINDUCTOR_COMPILE_THREADS=4
 export WANDB_MODE="${WANDB_MODE:-online}"
 
-# The data loader reads shards from S3 while training. The key expires after 8h, so
-# refuse a time limit that would outlive it (--time on the command line overrides the
-# default above)
-S3_KEY_TTL_SECONDS=$((8 * 3600))
-time_limit=$(squeue -j "$SLURM_JOB_ID" -h -o %l)
-days=0
-if [[ "$time_limit" == *-* ]]; then
-    days=${time_limit%%-*}
-    time_limit=${time_limit#*-}
-fi
-IFS=: read -r -a parts <<< "$time_limit"
-seconds=0
-for part in "${parts[@]}"; do
-    seconds=$((seconds * 60 + 10#$part))
-done
-seconds=$((seconds + days * 86400))
-if ((seconds >= S3_KEY_TTL_SECONDS)); then
-    echo "time limit $(squeue -j "$SLURM_JOB_ID" -h -o %l) is not below the 8h S3 key" >&2
-    exit 1
-fi
-eval "$(flock s3 credentials --ttl 8h)"
+# The data loader reads shards from S3 while training. A key from `flock s3
+# credentials` in AWS_* variables would expire mid-run, so use the flock profile
+# instead: its credential_process lets pyarrow's S3 client fetch a new key when the old
+# one expires. The AWS SDK prefers keys in the environment, so none may be set
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+export AWS_PROFILE=flock
 
 echo "job $SLURM_JOB_ID on $(hostname), GPU $CUDA_VISIBLE_DEVICES, commit $(git rev-parse --short HEAD)"
 echo "args: $*"
