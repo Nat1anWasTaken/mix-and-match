@@ -2,7 +2,8 @@
 Pre-tokenize FineWeb-Edu into globally shuffled shards, until a token budget.
 
     eval "$(flock s3 credentials --ttl 24h)"
-    uv run prepare.py --output s3://<bucket>/sources/fineweb-edu-llama3 \\
+    uv run prepare.py --dataset s3://flock-datasets/fineweb-edu \\
+        --output s3://<bucket>/sources/fineweb-edu-llama3 \\
         --token-budget 30000000000 \\
         --fragments /work/<user>/fragments/fineweb-edu-llama3 \\
         --run-name prepare-fineweb-edu-llama3
@@ -74,7 +75,6 @@ from src.tokenizer import (
 )
 
 TOKENIZER_NAME = "meta-llama/Llama-3.2-1B"
-DATASET_URI = "s3://flock-datasets/fineweb-edu"
 DEVELOPMENT_DATASET = "cerulean-works/fineweb-edu-dev"
 DEVELOPMENT_SIZE = 5000
 SHARD_FORMAT = (
@@ -192,7 +192,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--tokenizer", default=TOKENIZER_NAME)
-    parser.add_argument("--dataset", default=DATASET_URI)
+    parser.add_argument(
+        "--dataset", required=True, help="Lance dataset URI, local path or s3://"
+    )
     parser.add_argument("--development-dataset", default=DEVELOPMENT_DATASET)
     parser.add_argument("--run-name", required=True, help="names the wandb run")
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
