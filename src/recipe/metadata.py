@@ -19,7 +19,7 @@ mirror matches one scored from S3.
 """
 
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 
 import lance
@@ -149,10 +149,13 @@ def scan_columns(
     fragment_ids: Iterable[int],
     columns: list[str],
     workers: int = 16,
+    on_fragment: Callable[[int], None] | None = None,
 ) -> tuple[RowIds, dict[str, numpy.ndarray]]:
     """
     The row addresses and values of every row of the given fragments, in scan order.
-    Lance reads release the GIL, so threads overlap the fragment reads
+    Lance reads release the GIL, so threads overlap the fragment reads. on_fragment is
+    called on the calling thread with each fragment's row count, in fragment order, as
+    the fragments finish
     """
 
     def scan(fragment_id: int) -> tuple[RowIds, dict[str, numpy.ndarray]]:
@@ -169,8 +172,15 @@ def scan_columns(
         }
         return addresses, values
 
+    parts: list[tuple[RowIds, dict[str, numpy.ndarray]]] = []
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        parts = list(pool.map(scan, fragment_ids))
+        # map yields in fragment_ids order however the threads finish
+        for part in pool.map(scan, fragment_ids):
+            parts.append(part)
+
+            if on_fragment is not None:
+                on_fragment(part[0].size)
 
     addresses = numpy.concatenate([part[0] for part in parts])
     values = {

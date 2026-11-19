@@ -10,8 +10,9 @@ this module handles the rest:
         parser.add_argument("--store", required=True)
 
     def compile(context: Context) -> None:
-        source = context.open("fwedu", context.arguments.store, columns=["paloma"])
-        clean = source.where("paloma", lambda matches: matches == 0)
+        kind = "paloma_decontamination"
+        source = context.open("fwedu", context.arguments.store, columns=[kind])
+        clean = source.where(kind, lambda matches: matches == 0)
         context.phase("main")
         context.cursor("fwedu", clean.sample(context.budget()))
 
@@ -361,12 +362,13 @@ def _git(directory: Path, *arguments: str) -> str | None:
 
 
 def compiler_record(
-    compile: Callable[[Context], None], path: Path, arguments: argparse.Namespace
+    compile: Callable[..., object], path: Path, arguments: argparse.Namespace
 ) -> dict[str, Any]:
     """
     Where the recipe's rules came from. dirty means the working tree had uncommitted
     changes, so the commit alone may not reproduce the recipe; compiler.py still has
-    the compiler's own code, though not the harness's
+    the compiler's own code, though not the harness's. Scorers record their setup the
+    same way (see scorers/harness.py)
     """
     module = compile.__module__
 
