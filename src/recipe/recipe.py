@@ -100,7 +100,7 @@ class Recipe:
         return content
 
     @staticmethod
-    def from_dict(content: Mapping[str, Any], uri: str = "") -> "Recipe":
+    def from_dict(content: Mapping[str, Any], uri: str = "") -> Recipe:
         if content["version"] not in READABLE_VERSIONS:
             raise ValueError(
                 f"recipe version {content['version']}, expected one of "

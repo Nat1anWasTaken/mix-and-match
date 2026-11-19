@@ -118,7 +118,7 @@ PROGRESS_SECONDS = 30
 tokenizer_worker: FragmentTokenizer | None = None
 gatherer_worker: BucketGatherer | None = None
 # Where tokenizer workers put the tokens of each piece they encode, for progress
-progress_queue: "multiprocessing.Queue[int] | None" = None
+progress_queue: multiprocessing.Queue[int] | None = None
 
 # A phase 1 task: (fragment_id, offset, limit, rows of the fragment)
 type Chunk = tuple[int, int, int, int]
@@ -132,7 +132,7 @@ def initialize_tokenizer(
     seed: int,
     num_buckets: int,
     batch_size: int,
-    progress: "multiprocessing.Queue[int]",
+    progress: multiprocessing.Queue[int],
 ) -> None:
     global tokenizer_worker, progress_queue
 
