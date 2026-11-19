@@ -4,6 +4,7 @@ The compiled recipe: what RecipeTokenStream trains on.
 A recipe directory holds recipe.json plus one selection per (phase, cursor, shard):
 
     <recipe>/recipe.json
+    <recipe>/compiler.py                                the compiler that wrote it
     <recipe>/selections/<phase>/<cursor>/<shard>.npy    sorted unique uint32 doc indices
 
 A recipe is a list of phases, trained in order. A phase is a set of cursors mixed
@@ -14,6 +15,11 @@ lives in a selection file, so the JSON stays small at any scale.
 
 A cursor marked repeat holds extra copies of documents some non-repeat cursor already
 selects. Their tokens are the ones LAB.md lets us repeat for free, up to 10% of the rest.
+
+A recipe's rules live in its compiler's code (src/recipe/compilers/, run through
+src/recipe/compile.py), so version 2 keeps that code: a copy in compiler.py, and in
+recipe.json's "compiler" the module, git commit and arguments it ran with. Version 1
+recipes have no compiler record and still load.
 """
 
 import dataclasses
@@ -28,8 +34,11 @@ from numpy.typing import ArrayLike
 
 from ..tokenizer import ShardStore
 
-RECIPE_VERSION = 1
+RECIPE_VERSION = 2
+# Versions load_recipe reads; 1 is 2 without the compiler record
+READABLE_VERSIONS = (1, 2)
 RECIPE_FILE = "recipe.json"
+COMPILER_FILE = "compiler.py"
 MAX_REPEAT_FRACTION = 0.1
 
 # Names become path components of the selection files
@@ -75,6 +84,8 @@ class Recipe:
     total_tokens: int
     repeated_tokens: int
     phases: list[Phase]
+    # What wrote the recipe: module, path, git commit, arguments. None in version 1
+    compiler: dict[str, Any] | None = None
     # Where the recipe was loaded from; not part of recipe.json
     uri: str = ""
 
@@ -90,9 +101,10 @@ class Recipe:
 
     @staticmethod
     def from_dict(content: Mapping[str, Any], uri: str = "") -> "Recipe":
-        if content["version"] != RECIPE_VERSION:
+        if content["version"] not in READABLE_VERSIONS:
             raise ValueError(
-                f"recipe version {content['version']}, expected {RECIPE_VERSION}"
+                f"recipe version {content['version']}, expected one of "
+                f"{READABLE_VERSIONS}"
             )
 
         return Recipe(
@@ -123,6 +135,7 @@ class Recipe:
                 )
                 for phase in content["phases"]
             ],
+            compiler=content.get("compiler"),
             uri=uri,
         )
 
@@ -423,12 +436,20 @@ class RecipeBuilder:
             phases=phases,
         )
 
-    def write(self, uri: str) -> Recipe:
+    def write(
+        self,
+        uri: str,
+        compiler: Mapping[str, Any] | None = None,
+        compiler_source: str | None = None,
+    ) -> Recipe:
         """
-        Selections first, recipe.json last as the commit point. A recipe names a run's
-        data, so an existing one is never overwritten
+        Selections and compiler.py first, recipe.json last as the commit point. A recipe
+        names a run's data, so an existing one is never overwritten. compiler is the
+        record for recipe.json, compiler_source the code copied to compiler.py
         """
-        recipe = self.build()
+        recipe = dataclasses.replace(
+            self.build(), compiler=None if compiler is None else dict(compiler)
+        )
         store = ShardStore(uri)
 
         if store.read_json(RECIPE_FILE) is not None:
@@ -439,6 +460,9 @@ class RecipeBuilder:
                 store.write_array(
                     _selection_path(cursor.phase, cursor.name, shard), documents
                 )
+
+        if compiler_source is not None:
+            store.write_text(COMPILER_FILE, compiler_source)
 
         store.write_json(RECIPE_FILE, recipe.to_dict())
         return dataclasses.replace(recipe, uri=store.uri)
