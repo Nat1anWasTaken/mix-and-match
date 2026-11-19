@@ -152,6 +152,16 @@ class ShardStore:
 
         self.filesystem.move(str(temporary_path), str(self._path(name)))
 
+    def write_text(self, name: str, content: str) -> None:
+        self.filesystem.create_dir(str(self._path(name).parent), recursive=True)
+
+        temporary_path = self._path(name + ".tmp")
+
+        with self.filesystem.open_output_stream(str(temporary_path)) as stream:
+            stream.write(content.encode())
+
+        self.filesystem.move(str(temporary_path), str(self._path(name)))
+
     # Paths stay PurePosixPath inside the class; the damn pyarrow only accepts str, so
     # convert with str() right at each pyarrow call
 
