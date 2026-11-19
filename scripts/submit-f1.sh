@@ -79,13 +79,25 @@ if [[ ${1:-} == --watch ]]; then
     sync_pid=""
 
     if [[ -n $run_name ]]; then
-        # The job's run directory appears once wandb.init runs in it
+        # The job's run directory appears once wandb.init runs in it. wandb_dir is this
+        # job's own (see f1-cpu.sbatch), so a run left by an earlier job of the same
+        # name is never picked up. Checked often, so a short job is still synced while
+        # it runs; once more after the job ends, in case it finished between checks
         run_dir=""
 
-        while [[ -z $run_dir ]] && job_running "$jobid"; do
-            sleep 30
-            run_dir=$(ls -dt "$wandb_dir"/wandb/offline-run-* 2>/dev/null | head -1 || true)
+        while true; do
+            run_dir=$(ls -d "$wandb_dir"/wandb/offline-run-* 2>/dev/null | head -1 || true)
+
+            if [[ -n $run_dir ]] || ! job_running "$jobid"; then
+                break
+            fi
+
+            sleep 5
         done
+
+        if [[ -z $run_dir ]]; then
+            run_dir=$(ls -d "$wandb_dir"/wandb/offline-run-* 2>/dev/null | head -1 || true)
+        fi
 
         if [[ -n $run_dir ]]; then
             echo "syncing $run_dir to wandb run $run_name"
@@ -159,8 +171,9 @@ if has_flag --no-wandb "$@"; then
 fi
 
 job_name=${run_name:-$script_name}
-wandb_dir=$PWD/logs/wandb/$job_name
-mkdir -p logs "$wandb_dir"
+# Each job writes its run under its own <job id>/ in here (see f1-cpu.sbatch)
+wandb_root=$PWD/logs/wandb/$job_name
+mkdir -p logs "$wandb_root"
 
 uv sync --frozen
 s3_credentials
@@ -171,14 +184,14 @@ uv run --frozen python -u "$@" --stage fetch
 echo "== process"
 # shellcheck disable=SC2086  # SBATCH_ARGS is a list of options
 jobid=$(
-    WANDB_DIR=$wandb_dir sbatch --parsable --job-name="$job_name" ${SBATCH_ARGS:-} \
+    F1_WANDB_ROOT=$wandb_root sbatch --parsable --job-name="$job_name" ${SBATCH_ARGS:-} \
         scripts/f1-cpu.sbatch "$@" --stage process
 )
 jobid=${jobid%%;*}
 echo "submitted job $jobid, log: logs/$job_name-$jobid.out"
 
 # nohup + setsid: the watcher outlives this shell and the terminal
-setsid nohup "$self" --watch "$jobid" "$wandb_dir" "$run_name" "$@" \
+setsid nohup "$self" --watch "$jobid" "$wandb_root/$jobid" "$run_name" "$@" \
     > "logs/submit-$jobid.log" 2>&1 < /dev/null &
 
 echo "watcher log: logs/submit-$jobid.log (wandb sync, then upload)"

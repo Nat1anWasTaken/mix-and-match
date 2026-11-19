@@ -31,8 +31,15 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export UV_OFFLINE=1
-# wandb writes to $WANDB_DIR/wandb/; submit-f1.sh syncs it from the login node
+# wandb writes to $WANDB_DIR/wandb/; submit-f1.sh syncs it from the login node.
+# submit-f1.sh passes F1_WANDB_ROOT, and every job gets its own directory in it, so a
+# rerun of the same run name never shares one with the job before it
 export WANDB_MODE=offline
+
+if [[ -n ${F1_WANDB_ROOT:-} ]]; then
+    export WANDB_DIR=$F1_WANDB_ROOT/$SLURM_JOB_ID
+    mkdir -p "$WANDB_DIR"
+fi
 
 # python -u <script> or python -u -m <module>; --workers goes right after it, so a
 # --workers in the arguments comes later and wins
