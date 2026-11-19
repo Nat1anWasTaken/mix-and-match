@@ -70,6 +70,9 @@ class ShardStore:
     def has_shard(self, name: str) -> bool:
         return self._is_file(self._shard_path(name, "offsets.npy"))
 
+    def has_row_ids(self, name: str) -> bool:
+        return self._is_file(self._shard_path(name, "row_ids.npy"))
+
     def read_offsets(self, name: str) -> Offsets:
         return self._load(self._shard_path(name, "offsets.npy"))
 
