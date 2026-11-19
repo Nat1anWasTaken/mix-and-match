@@ -41,7 +41,7 @@ written.
 On hosts whose compute nodes have no internet (Forerunner1), split it into stages with
 the same arguments (scripts/submit-f1.sh runs all three):
 
-    --stage fetch     login node: caches the tokenizer and development ids, and copies
+    --stage fetch     login node: caches the tokenizer, and copies
                       the first fragments of the shuffled order into --mirror, until
                       their estimated tokens reach --mirror-margin x the budget. The
                       estimate is the source's token_count column if it has one (FineWeb-
@@ -81,7 +81,6 @@ from src.tokenizer import (
     ShardStore,
     chunk_ranges,
     chunk_shard_name,
-    load_development_ids,
     load_tokenizer,
     open_dataset,
     shuffled_fragment_ids,
@@ -89,8 +88,6 @@ from src.tokenizer import (
 
 TOKENIZER_NAME = "meta-llama/Llama-3.2-1B"
 DATASET_URI = "s3://flock-datasets/fineweb-edu"
-DEVELOPMENT_DATASET = "cerulean-works/fineweb-edu-dev"
-DEVELOPMENT_SIZE = 5000
 SHARD_FORMAT = (
     "data/<shard>/: [BOS, text, EOS] int32 tokens.npy + int64 offsets.npy + "
     "int64 row_ids.npy (Lance _rowaddr), globally shuffled into buckets"
@@ -131,7 +128,6 @@ def initialize_tokenizer(
     dataset_uri: str,
     dataset_version: int,
     tokenizer_name: str,
-    exclude_ids: frozenset[str],
     fragments_uri: str,
     seed: int,
     num_buckets: int,
@@ -146,7 +142,6 @@ def initialize_tokenizer(
     tokenizer_worker = FragmentTokenizer(
         open_dataset(dataset_uri, dataset_version),
         load_tokenizer(tokenizer_name),
-        exclude_ids,
         ShardStore(fragments_uri),
         seed,
         num_buckets,
@@ -227,7 +222,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--tokenizer", default=TOKENIZER_NAME)
     parser.add_argument("--dataset", default=DATASET_URI)
-    parser.add_argument("--development-dataset", default=DEVELOPMENT_DATASET)
     parser.add_argument("--run-name", required=True, help="names the wandb run")
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
     add_stage_arguments(parser)
@@ -258,11 +252,11 @@ type FragmentCounter = Callable[[int], tuple[int, float]]
 
 
 def sample_texts(
-    fragment: LanceFragment, exclude_ids: frozenset[str], seed: int
+    fragment: LanceFragment, seed: int
 ) -> list[str]:
     """
     A sample of the fragment's rows, as --stage process keeps them: the text, or "" for
-    the empty and development rows it drops. The offsets depend only on (seed, fragment)
+    the empty rows it drops. The offsets depend only on (seed, fragment)
     """
     rows = fragment.count_rows()
     limit = min(SAMPLE_SLICE_ROWS, rows)
@@ -270,17 +264,8 @@ def sample_texts(
     texts: list[str] = []
 
     for offset in random_generator.integers(rows - limit + 1, size=SAMPLE_SLICES):
-        table = fragment.to_table(
-            columns=["id", "text"], offset=int(offset), limit=limit
-        )
-        texts.extend(
-            text if text and document_id not in exclude_ids else ""
-            for document_id, text in zip(
-                table.column("id").to_pylist(),
-                table.column("text").to_pylist(),
-                strict=True,
-            )
-        )
+        table = fragment.to_table(columns=["text"], offset=int(offset), limit=limit)
+        texts.extend(text or "" for text in table.column("text").to_pylist())
 
     return texts
 
@@ -394,7 +379,6 @@ def fetch(arguments: argparse.Namespace) -> None:
     )
 
     tokenizer = load_tokenizer(arguments.tokenizer)
-    exclude_ids = load_development_ids(arguments.development_dataset, DEVELOPMENT_SIZE)
 
     workers = min(arguments.workers, 32)
     fragment_ids = shuffled_fragment_ids(dataset, arguments.seed)
@@ -424,7 +408,7 @@ def fetch(arguments: argparse.Namespace) -> None:
         calibration_ids = fragment_ids[:CALIBRATION_FRAGMENTS]
 
         def sample(fragment_id: int) -> list[str]:
-            return sample_texts(get_fragment(fragment_id), exclude_ids, arguments.seed)
+            return sample_texts(get_fragment(fragment_id), arguments.seed)
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             samples = dict(zip(calibration_ids, pool.map(sample, calibration_ids)))
@@ -449,7 +433,7 @@ def fetch(arguments: argparse.Namespace) -> None:
             texts = samples.get(fragment_id)
 
             if texts is None:
-                texts = sample_texts(fragment, exclude_ids, arguments.seed)
+                texts = sample_texts(fragment, arguments.seed)
 
             return estimate_tokens(fragment.count_rows(), texts, tokens_per_character)
 
@@ -517,7 +501,6 @@ def process(arguments: argparse.Namespace) -> None:
         "tokenizer": arguments.tokenizer,
         "dataset": arguments.dataset,
         "dataset_version": dataset.version,
-        "development_dataset": arguments.development_dataset,
         "format": SHARD_FORMAT,
         "layout": LAYOUT_VERSION,
         "seed": arguments.seed,
@@ -537,7 +520,6 @@ def process(arguments: argparse.Namespace) -> None:
     # Download into the HF cache once here, so workers don't all race to download it,
     load_tokenizer(arguments.tokenizer)
 
-    exclude_ids = load_development_ids(arguments.development_dataset, DEVELOPMENT_SIZE)
     fragment_ids = shuffled_fragment_ids(dataset, arguments.seed)
     # The mirror lists every fragment but holds the data of a prefix of this order only
     mirror_ran_out = False
@@ -617,7 +599,6 @@ def process(arguments: argparse.Namespace) -> None:
             dataset_uri,
             dataset.version,
             arguments.tokenizer,
-            exclude_ids,
             fragment_store.uri,
             arguments.seed,
             num_buckets,

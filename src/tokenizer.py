@@ -9,8 +9,6 @@ from pathlib import Path, PurePosixPath
 import lance
 import numpy
 import pyarrow.fs
-import pyarrow.parquet
-from huggingface_hub import snapshot_download
 from lance import LanceDataset
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
@@ -249,27 +247,6 @@ def load_tokenizer(name: str) -> PreTrainedTokenizerFast:
     return tokenizer
 
 
-def load_development_ids(repository_id: str, expected_size: int) -> frozenset[str]:
-    local_dir = Path(
-        snapshot_download(
-            repository_id, repo_type="dataset", allow_patterns=["*.parquet"]
-        )
-    )
-
-    document_ids: set[str] = set()
-
-    for path in sorted(local_dir.rglob("*.parquet")):
-        table = pyarrow.parquet.read_table(path, columns=["id"])
-        document_ids.update(table.column("id").to_pylist())
-
-    if len(document_ids) != expected_size:
-        raise ValueError(
-            f"expected {expected_size} development ids, got {len(document_ids)}"
-        )
-
-    return frozenset(document_ids)
-
-
 def open_dataset(uri: str, version: int | None = None) -> LanceDataset:
     return lance.dataset(uri, version=version)
 
@@ -299,7 +276,6 @@ class FragmentTokenizer:
         self,
         dataset: LanceDataset,
         tokenizer: PreTrainedTokenizerFast,
-        exclude_ids: frozenset[str],
         store: ShardStore,
         seed: int,
         num_buckets: int,
@@ -313,7 +289,6 @@ class FragmentTokenizer:
 
         self.dataset = dataset
         self.tokenizer = tokenizer
-        self.exclude_ids = exclude_ids
         self.store = store
         self.seed = seed
         self.num_buckets = num_buckets
@@ -438,23 +413,16 @@ class FragmentTokenizer:
             raise ValueError(f"fragment {fragment_id} does not exist")
 
         for batch in fragment.to_batches(
-            columns=["id", "text"],
+            columns=["text"],
             batch_size=self.batch_size,
             offset=offset,
             limit=limit,
             with_row_address=True,
         ):
-            document_ids = batch.column("id").to_pylist()
             texts = batch.column("text").to_pylist()
             row_addresses = batch.column("_rowaddr").to_numpy().astype(numpy.int64)
 
-            keep = numpy.array(
-                [
-                    bool(text) and document_id not in self.exclude_ids
-                    for document_id, text in zip(document_ids, texts, strict=True)
-                ],
-                dtype=bool,
-            )
+            keep = numpy.array([bool(text) for text in texts], dtype=bool)
 
             yield (
                 [text for text, kept in zip(texts, keep, strict=True) if kept],
