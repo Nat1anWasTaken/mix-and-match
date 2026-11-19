@@ -50,3 +50,8 @@ invalid-mutable-override = "ignore"
 
 [tool.ruff.lint]
 extend-select = ["ANN", "N"]
+
+[tool.ruff.lint.isort]
+# wandb/ in the repo root is run output, which would make ruff sort `import wandb` as
+# first-party; flock's pyproject pins it the same way
+known-third-party = ["wandb"]
