@@ -1,0 +1,30 @@
+{
+  "name": "dolma-v1_7",
+  "notes": [
+    "Weights are the billions of OLMo tokens OLMo 7B-v1.7 trained on per source: the 'OLMo tokens (billions)' column of the Dolma v1.7 summary table on huggingface.co/datasets/allenai/dolma, times its 'Sample Proportion'. Only their ratios matter.",
+    "The card gives one row each for Dolma's CC (1,195.5 x 50% = 597.75) and CC News (14.3 x 100%). They are split over cc_en_head/middle/tail and cc_news_head/middle/tail by the on-disk size of each folder's Lance data on flock-datasets (CC: 955.07, 1219.06, 1108.78 GB; CC News: 23.44, 10.74, 4.36 GB), an estimate.",
+    "C4 uses the card's 50% (138.4 x 50% = 69.2). The card's sampled total of 1,715.1 matches C4 at 100% instead; these rows sum to 1,645.15.",
+    "Wikipedia's 200% means two epochs in OLMo. Here it only sets the share; the compiler samples unique documents."
+  ],
+  "sources": {
+    "cc_en_head": {"weight": 173.9},
+    "cc_en_middle": {"weight": 221.97},
+    "cc_en_tail": {"weight": 201.89},
+    "falcon-refinedweb-filtered": {"weight": 456.4},
+    "starcoder": {"weight": 263.8},
+    "c4-filtered": {"weight": 69.2},
+    "reddit": {"weight": 79.9},
+    "pes2o": {"weight": 57.2},
+    "redpajama-arxiv": {"weight": 28.0},
+    "redpajama-stackexchange": {"weight": 19.6},
+    "tulu_flan": {"weight": 16.5},
+    "cc_news_head": {"weight": 8.7},
+    "cc_news_middle": {"weight": 3.99},
+    "cc_news_tail": {"weight": 1.62},
+    "proof_pile_2-open_web_math": {"weight": 12.6},
+    "proof_pile_2-algebraic_stack": {"weight": 12.6},
+    "books": {"weight": 5.3},
+    "wikiref_megawika": {"weight": 4.6},
+    "wiki": {"weight": 7.4}
+  }
+}
