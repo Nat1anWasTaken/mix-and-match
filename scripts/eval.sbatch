@@ -17,6 +17,12 @@
 # The 9-source macro bits per byte is then written to the training run's wandb summary as
 # paloma_ppl (with paloma_ppl_step and paloma_ppl_model), which is what the OJ reads.
 # The last eval to finish sets it, so score the checkpoint you mean to submit last.
+#
+# To score a checkpoint without touching what the OJ reads (e.g. intermediate checkpoints for
+# an analysis), add --no-report as a fourth argument: the result stays in results.json only.
+#
+#   sbatch scripts/eval.sbatch dolma-v1_7-150m-30b 5600 8c5683d --no-report
+#
 # flock eval run wants a new or empty --out, so a rerun needs that directory moved away first
 #SBATCH --job-name=eval
 #SBATCH --account=ACD115198
@@ -33,14 +39,23 @@ set -euo pipefail
 
 cd "$SLURM_SUBMIT_DIR"
 
-if [ $# -ne 3 ]; then
-    echo "usage: sbatch scripts/eval.sbatch <run-name> <step> <train-commit>" >&2
+usage="usage: sbatch scripts/eval.sbatch <run-name> <step> <train-commit> [--no-report]"
+if [ $# -lt 3 ] || [ $# -gt 4 ]; then
+    echo "$usage" >&2
     exit 2
 fi
 
 run=$1
 step=$2
 commit=$3
+report=1
+if [ $# -eq 4 ]; then
+    if [ "$4" != "--no-report" ]; then
+        echo "$usage" >&2
+        exit 2
+    fi
+    report=0
+fi
 tag=$run-step$step-$commit
 checkpoint=checkpoints/$run/step-$step
 model=cerulean-labs/$run
@@ -74,6 +89,11 @@ uv run --frozen flock eval run \
     --out "$out"
 
 echo "results in $out/results.json"
+
+if [ "$report" -eq 0 ]; then
+    echo "--no-report: the training run's summary is left as it is"
+    exit 0
+fi
 
 uv run --frozen python -m src.report_eval "$out/results.json" \
     --run-name "$run" --eval paloma --key paloma_ppl --step "$step" \
