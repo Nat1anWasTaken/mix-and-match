@@ -10,9 +10,11 @@ dependencies = [
     # its workspace members' pyprojects (flock/eval, flock/cli, ...), which are virtual
     # (package = false) and so cannot be installed as dependencies. The flock.eval and
     # flock.cli runtime deps this project does not already have are listed here instead,
-    # the same set the flock uv tool install uses
+    # the same set the flock uv tool install uses, plus boto3: flock.hub's model upload
+    # (`flock models import` / `push`) builds a boto3 S3 client, and that set lacks it
     "flock",
     "accelerate>=1.15.0",
+    "boto3",
     "click>=8.5.0",
     "datasets>=5.1.0",
     "httpx>=0.28.1",
