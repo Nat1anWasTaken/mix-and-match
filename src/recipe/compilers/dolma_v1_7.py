@@ -13,7 +13,7 @@ RecipeTokenStream picks a cursor with probability proportional to its remaining
 documents, so every cursor drains at the same relative rate and these shares hold
 throughout training, not only on average.
 
-Run src.recipe.scorers.paloma on every store first. A document is dropped if any of its
+Run src.recipe.scorers.paloma_decontamination on every store first. A document is dropped if any of its
 paragraphs matched (Paloma App. C.1.1 removes whole documents). A source with too few
 clean tokens for its share is an error, not a quietly different mixture: prepare it
 again with a larger --token-budget (and a new --output).
@@ -68,7 +68,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help=f"store URI of every source, with {PLACEHOLDER} in it",
     )
     parser.add_argument(
-        "--kind", default="paloma", help="meta/<kind> column from the paloma scorer"
+        "--kind",
+        default="paloma_decontamination",
+        help="meta/<kind> column from the paloma_decontamination scorer",
     )
 
 

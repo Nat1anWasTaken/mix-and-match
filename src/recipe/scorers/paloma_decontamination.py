@@ -2,12 +2,13 @@
 Paloma decontamination (Paloma App. C.1.1): count, per document, the paragraphs that
 also appear in Paloma's evaluation data.
 
-    uv run python -m src.recipe.scorers.paloma \\
-        --store s3://<bucket>/sources/fineweb-edu-llama3
+    uv run python -m src.recipe.scorers.paloma_decontamination \\
+        --store s3://<bucket>/sources/fineweb-edu-llama3 \\
+        --run-name score-paloma_decontamination-fineweb-edu-llama3
 
 Paloma is gated: accept its terms on Hugging Face and log in (`hf auth login`) first.
 
-Takes --stage like prepare.py (see src/stages.py): fetch downloads Paloma into the
+Takes --stage like prepare.py (see src/stages.py and harness.py): fetch downloads Paloma into the
 Hugging Face cache and mirrors the store's source fragments, process scores offline from
 the cache and --mirror, upload copies the store to --remote. Pass the same --revision to
 every stage, or none to use what fetch cached as the latest.
@@ -33,19 +34,15 @@ import functools
 import gzip
 import hashlib
 import json
-import os
 import re
-import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
 import numpy
 from huggingface_hub import snapshot_download
 
-from ...stages import add_stage_arguments, check_stage, upload_store
-from ...tokenizer import ShardStore
-from ..metadata import fetch_source_fragments, is_complete
-from .text import ScoreFunction, score_texts
+from .harness import Context, TextScorer, run
+from .text import ScoreFunction
 
 PALOMA_REPOSITORY = "allenai/paloma"
 MIN_PARAGRAPH_WORDS = 13
@@ -144,12 +141,7 @@ def build(hashes_path: str) -> ScoreFunction:
     return score
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("--store", required=True, help="shard store from prepare.py")
-    parser.add_argument("--kind", default="paloma", help="metadata kind to write")
+def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--revision", help=f"{PALOMA_REPOSITORY} revision; default: the latest commit"
     )
@@ -158,56 +150,42 @@ def main() -> None:
         nargs="+",
         help="Paloma sources to match against, e.g. c4_en ptb; default: all of them",
     )
-    parser.add_argument("--workers", type=int, default=os.cpu_count() or 1)
-    add_stage_arguments(parser)
-    arguments = parser.parse_args()
-    check_stage(arguments, "store")
 
-    store = ShardStore(arguments.store)
 
-    if arguments.stage == "upload":
-        if not is_complete(store, arguments.kind):
-            raise FileNotFoundError(
-                f"{store.uri} lacks shards of meta/{arguments.kind}"
-            )
-
-        upload_store(store.uri, arguments.remote)
-        return
-
-    root, commit = download_paloma(arguments.revision)
+def fetch(context: Context) -> None:
+    _, commit = download_paloma(context.arguments.revision)
     print(f"{PALOMA_REPOSITORY} at {commit}", flush=True)
 
-    if arguments.stage == "fetch":
-        fetch_source_fragments(store, arguments.mirror, min(arguments.workers, 32))
-        return
-    hashes = evaluation_hashes(root, arguments.sources)
+
+def setup(context: Context) -> TextScorer:
+    # Offline (--stage process), the revision resolves from what fetch cached
+    root, commit = download_paloma(context.arguments.revision)
+    print(f"{PALOMA_REPOSITORY} at {commit}", flush=True)
+
+    hashes = evaluation_hashes(root, context.arguments.sources)
     print(f"{hashes.size:,} unique Paloma paragraphs", flush=True)
 
     if hashes.size == 0:
         raise ValueError("no Paloma paragraph is long enough to match")
 
-    info = {
-        "scorer": "paloma",
-        "repository": PALOMA_REPOSITORY,
-        "revision": commit,
-        "sources": sorted(arguments.sources) if arguments.sources else None,
-        "min_paragraph_words": MIN_PARAGRAPH_WORDS,
-        "paragraphs": int(hashes.size),
-    }
+    # Workers memory-map the hashes instead of each receiving a pickled copy
+    hashes_path = context.scratch / "hashes.npy"
+    numpy.save(hashes_path, hashes)
 
-    with tempfile.TemporaryDirectory() as directory:
-        # Workers memory-map the hashes instead of each receiving a pickled copy
-        hashes_path = os.path.join(directory, "hashes.npy")
-        numpy.save(hashes_path, hashes)
-        score_texts(
-            store,
-            arguments.kind,
-            functools.partial(build, hashes_path),
-            info,
-            arguments.workers,
-            mirror=arguments.mirror,
-        )
+    return TextScorer(
+        info={
+            "scorer": "paloma_decontamination",
+            "repository": PALOMA_REPOSITORY,
+            "revision": commit,
+            "sources": sorted(context.arguments.sources)
+            if context.arguments.sources
+            else None,
+            "min_paragraph_words": MIN_PARAGRAPH_WORDS,
+            "paragraphs": int(hashes.size),
+        },
+        build=functools.partial(build, str(hashes_path)),
+    )
 
 
 if __name__ == "__main__":
-    main()
+    run(setup, add_arguments, fetch=fetch, kind="paloma_decontamination")
