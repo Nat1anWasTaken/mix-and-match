@@ -44,7 +44,7 @@ flowchart TB
 
 ## Setup
 
-The project uses [uv](https://docs.astral.sh/uv/) with Python 3.12.
+The project uses [uv](https://docs.astral.sh/uv/) with Python 3.14.
 
 ```bash
 uv sync

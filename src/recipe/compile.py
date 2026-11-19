@@ -73,7 +73,7 @@ class Source:
     name: str
     store: ShardStore
     lengths: dict[str, Lengths]
-    context: "Context"
+    context: Context
     columns: dict[str, dict[str, numpy.ndarray]] = dataclasses.field(
         default_factory=dict
     )
@@ -95,7 +95,7 @@ class Source:
 
         return self.columns[kind]
 
-    def all(self) -> "Docs":
+    def all(self) -> Docs:
         return Docs(
             self,
             {
@@ -107,7 +107,7 @@ class Source:
 
     def where(
         self, kind: str, predicate: Callable[[numpy.ndarray], numpy.ndarray]
-    ) -> "Docs":
+    ) -> Docs:
         """
         The documents whose meta/<kind> value passes predicate, a vectorized test that
         maps a shard's column to a boolean mask, e.g. lambda score: score >= 3
@@ -150,7 +150,7 @@ class Docs:
     def documents(self) -> int:
         return sum(documents.size for documents in self.selections.values())
 
-    def __and__(self, other: "Docs") -> "Docs":
+    def __and__(self, other: Docs) -> Docs:
         self._check_source(other)
         selections = {}
 
@@ -165,7 +165,7 @@ class Docs:
 
         return Docs(self.source, selections)
 
-    def __or__(self, other: "Docs") -> "Docs":
+    def __or__(self, other: Docs) -> Docs:
         self._check_source(other)
         selections = dict(self.selections)
 
@@ -177,11 +177,11 @@ class Docs:
 
         return Docs(self.source, dict(sorted(selections.items())))
 
-    def __sub__(self, other: "Docs") -> "Docs":
+    def __sub__(self, other: Docs) -> Docs:
         self._check_source(other)
         return Docs(self.source, subtract_selections(self.selections, other.selections))
 
-    def sample(self, tokens: int, exceed: bool = True) -> "Docs":
+    def sample(self, tokens: int, exceed: bool = True) -> Docs:
         """
         A uniform random sample worth tokens tokens. exceed takes the smallest sample
         that reaches it; without it, the largest that stays within it (for hard limits
@@ -192,7 +192,7 @@ class Docs:
         }
         return self._take(priorities, tokens, exceed)
 
-    def top(self, tokens: int, by: str, exceed: bool = True) -> "Docs":
+    def top(self, tokens: int, by: str, exceed: bool = True) -> Docs:
         """
         The highest-scored documents by meta/<by> worth tokens tokens, ties broken at
         random. One global ranking across shards, never a top-k per shard
@@ -205,7 +205,7 @@ class Docs:
 
     def _take(
         self, priorities: dict[str, numpy.ndarray], tokens: int, exceed: bool
-    ) -> "Docs":
+    ) -> Docs:
         try:
             selections = take_by_priority(
                 priorities,
@@ -220,7 +220,7 @@ class Docs:
 
         return Docs(self.source, selections)
 
-    def _check_source(self, other: "Docs") -> None:
+    def _check_source(self, other: Docs) -> None:
         if other.source is not self.source:
             raise ValueError(
                 f"can't combine documents of {self.source.name} and {other.source.name}"
@@ -355,7 +355,7 @@ def _git(directory: Path, *arguments: str) -> str | None:
             text=True,
             check=True,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return None
 
     return result.stdout.strip()
