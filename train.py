@@ -23,6 +23,8 @@ from src.trainer import Trainer, TrainingConfig
 TOKENIZER_NAME = "meta-llama/Llama-3.2-1B"
 WANDB_PROJECT = "lab7-data-curation"
 VOCAB_SIZE = 128256
+# Lab 7: repeats of up to this fraction of the training data don't count toward the score
+FREE_REPEAT_FRACTION = 0.1
 
 
 DistributedData = namedtuple("DistributedData", ["rank", "world_size", "device"])
@@ -194,6 +196,18 @@ def parse_arguments() -> argparse.Namespace:
         parser.error("--eval-limit must be at least 1")
 
     return arguments
+
+
+def oj_counted_tokens(total_tokens: int, repeated_share: float) -> int:
+    """
+    oj_total_tokens: the trained tokens minus the repeats that are free, which are at
+    most FREE_REPEAT_FRACTION of the unrepeated data. LAB.md's example: 220B trained, 20B
+    of them repeats, counts 200B; 230B with 30B repeats counts 210B, since only 20B of
+    the 30B are free
+    """
+    repeated = total_tokens * repeated_share
+    free = min(repeated, FREE_REPEAT_FRACTION * (total_tokens - repeated))
+    return round(total_tokens - free)
 
 
 def default_ckpt_every_steps(total_steps: int, log_every_steps: int) -> int:
@@ -470,7 +484,9 @@ def main() -> None:
         )
         total_tokens = trainer.state.tokens_seen
         logger.run.summary["total_tokens"] = total_tokens
-        logger.run.summary["oj_total_tokens"] = round(total_tokens * (1 - repeated_share))
+        logger.run.summary["oj_total_tokens"] = oj_counted_tokens(
+            total_tokens, repeated_share
+        )
         logger.finish()
 
     if torch.distributed.is_initialized():

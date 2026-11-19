@@ -14,6 +14,9 @@
 # The checkpoint becomes a version of cerulean-labs/<run-name> tagged
 # <run-name>-step<step>-<commit>, which names the run, step and code it came from, so the tag
 # stays unique across every model we push. Results go to checkpoints/<run-name>/paloma-step<step>/.
+# The 9-source macro bits per byte is then written to the training run's wandb summary as
+# paloma_ppl (with paloma_ppl_step and paloma_ppl_model), which is what the OJ reads.
+# The last eval to finish sets it, so score the checkpoint you mean to submit last.
 # flock eval run wants a new or empty --out, so a rerun needs that directory moved away first
 #SBATCH --job-name=eval
 #SBATCH --account=ACD115198
@@ -60,13 +63,18 @@ for file in "$checkpoint"/*; do
 done
 ls -la "$stage"
 
-flock models import "$stage" "$model" --tag "$tag"
-flock models versions "$model"
+# flock from the project environment (uv.lock), the same flock.eval the training eval uses
+uv run --frozen flock models import "$stage" "$model" --tag "$tag"
+uv run --frozen flock models versions "$model"
 
-flock eval run \
+uv run --frozen flock eval run \
     --model "flock:$model@$tag" \
     --suite paloma \
     --dtype float32 \
     --out "$out"
 
 echo "results in $out/results.json"
+
+uv run --frozen python -m src.report_eval "$out/results.json" \
+    --run-name "$run" --eval paloma --key paloma_ppl --step "$step" \
+    --model "flock:$model@$tag"
