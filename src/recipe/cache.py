@@ -20,11 +20,13 @@ once.
     python -m src.recipe.cache --recipe s3://mix-and-match/recipes/dolma-v1_7-30b \\
         --cache /work/u9216411/acd115198/recipe-cache
 
-Run it on a compute node (scripts/cache-recipe.sbatch). recipe.json is written last, so
-its presence means the copy is complete. A rerun skips shard files already there with
-the source's size, so an interrupted copy picks up where it stopped. train.py
---recipe-cache then reads the copy, and refuses one that is incomplete or whose
-recipe.json differs from the source rather than quietly falling back to S3.
+Run it on a compute node (scripts/cache-recipe.sbatch). Every file is written to a
+temporary file of its own and renamed into place once whole, and recipe.json is written
+last, so its presence means the copy is complete, even with several copies running at
+once. A rerun skips shard files already there with the source's size, so an interrupted
+copy picks up where it stopped. train.py --recipe-cache then reads the copy, and
+refuses one that is incomplete or whose recipe.json differs from the source rather than
+quietly falling back to S3.
 
 Assumes shard stores are immutable once written (prepare.py writes each shard once).
 A recipe directory may be recompiled in place, so when the cached recipe.json differs
@@ -33,7 +35,9 @@ from the source, the recipe's own files are copied again whatever their size.
 
 import argparse
 import dataclasses
+import json
 import os
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
@@ -68,21 +72,23 @@ class CachedFile:
 
 def recipe_files(recipe: Recipe) -> list[CachedFile]:
     """
-    Every file RecipeTokenStream reads for this recipe, except recipe.json itself
+    Every file RecipeTokenStream reads for this recipe, except recipe.json itself, once
+    per cache destination: store URIs that differ only by a trailing slash map to the
+    same files, and copying one file twice at once would race
     """
     files: dict[tuple[str, str], CachedFile] = {}
+
+    def add(file: CachedFile) -> None:
+        files.setdefault((file.store.rstrip("/"), file.relative), file)
 
     for phase in recipe.phases:
         for cursor in phase.cursors:
             for shard in cursor.shards:
-                selection = CachedFile(recipe.uri, shard.selection, in_recipe=True)
-                files[(selection.store, selection.relative)] = selection
+                add(CachedFile(recipe.uri, shard.selection, in_recipe=True))
 
                 for name in SHARD_FILES:
                     relative = str(PurePosixPath("data", shard.name, name))
-                    files[(cursor.store, relative)] = CachedFile(
-                        cursor.store, relative, in_recipe=False
-                    )
+                    add(CachedFile(cursor.store, relative, in_recipe=False))
 
     return list(files.values())
 
@@ -92,11 +98,16 @@ def copy_recipe(uri: str, cache: Path, workers: int = 16) -> Recipe:
     Copies a recipe and the shard files it reads into the cache, recipe.json last.
     Returns the recipe as loaded from the source
     """
-    recipe = load_recipe(uri)
+    # One read of recipe.json for both the file list and the commit point, so the
+    # recipe.json written to the cache names exactly the files copied for it, even if
+    # the source is recompiled during the copy
+    source_store = ShardStore(uri)
+    source_recipe_bytes = _read_bytes(source_store, RECIPE_FILE)
+    recipe = Recipe.from_dict(json.loads(source_recipe_bytes), uri=source_store.uri)
     files = [file for file in recipe_files(recipe) if file.store.startswith("s3://")]
+    mode = _file_mode()
 
     cached_recipe = Path(cache_path(recipe.uri, cache)) / RECIPE_FILE
-    source_recipe_bytes = _read_bytes(recipe.uri, RECIPE_FILE)
     recipe_changed = (
         not cached_recipe.is_file() or cached_recipe.read_bytes() != source_recipe_bytes
     )
@@ -122,22 +133,14 @@ def copy_recipe(uri: str, cache: Path, workers: int = 16) -> Recipe:
         if reuse and destination.is_file() and destination.stat().st_size == info.size:
             return -1
 
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        # Copied beside the target and renamed into place, so a file in the cache is
-        # always whole, even if the job dies mid-copy
-        temporary = destination.with_name(destination.name + ".tmp")
         # One read() of the whole file, one GET. pyarrow.fs.copy_files reads in 1 MB
         # chunks, each its own ranged GET, so latency capped it at ~12 MB/s per file.
         # A file is at most a few hundred MB, so holding it in memory is fine
         with store.filesystem.open_input_file(source) as stream:
             data = stream.read()
-        temporary.write_bytes(data)
-        if temporary.stat().st_size != info.size:
-            raise OSError(
-                f"copied {temporary.stat().st_size} bytes of {source}, "
-                f"expected {info.size}"
-            )
-        os.replace(temporary, destination)
+        if len(data) != info.size:
+            raise OSError(f"read {len(data)} bytes of {source}, expected {info.size}")
+        _write_atomically(destination, data, mode)
         return info.size
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -157,10 +160,7 @@ def copy_recipe(uri: str, cache: Path, workers: int = 16) -> Recipe:
                 )
 
     # The commit point: written only once every file it names is in place
-    cached_recipe.parent.mkdir(parents=True, exist_ok=True)
-    temporary = cached_recipe.with_name(cached_recipe.name + ".tmp")
-    temporary.write_bytes(source_recipe_bytes)
-    os.replace(temporary, cached_recipe)
+    _write_atomically(cached_recipe, source_recipe_bytes, mode)
     print(f"cache: {recipe.uri} -> {cached_recipe.parent}", flush=True)
 
     return recipe
@@ -215,10 +215,54 @@ def localize_recipe(recipe: Recipe, cache: Path) -> Recipe:
     )
 
 
-def _read_bytes(uri: str, name: str) -> bytes:
-    store = ShardStore(uri)
+def _read_bytes(store: ShardStore, name: str) -> bytes:
+    if not store._is_file(store.root / name):
+        raise FileNotFoundError(f"no {name} in {store.uri}")
+
     with store.filesystem.open_input_stream(str(store.root / name)) as stream:
         return stream.read()
+
+
+def _file_mode() -> int:
+    """
+    The mode open() would give a new file under the current umask (0o640 for umask
+    0o027). mkstemp creates its files 0o600, which would also cut the ACL mask and with
+    it the group's read access to the shared cache, so the copies get this mode back.
+    Read once before any copy thread starts, since os.umask is process-wide
+    """
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
+
+
+def _write_atomically(destination: Path, data: bytes, mode: int) -> None:
+    """
+    Writes data to destination through a temporary file of its own beside it, renamed
+    into place once whole. The temporary name is unique, so two jobs copying the same
+    file never write into each other's file, and a file in the cache is always one
+    job's complete copy. On failure only this call's temporary file is removed
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(
+        dir=destination.parent, prefix=f"{destination.name}.", suffix=".tmp"
+    )
+    temporary = Path(name)
+
+    try:
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(data)
+        os.chmod(temporary, mode)
+
+        if temporary.stat().st_size != len(data):
+            raise OSError(
+                f"wrote {temporary.stat().st_size} bytes to {temporary}, "
+                f"expected {len(data)}"
+            )
+
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def main() -> None:
