@@ -17,6 +17,13 @@
 #
 #   sbatch --gpus-per-node=H200:8 --cpus-per-task=96 --mem=1000G --time=04:45:00 ...
 #
+# For several nodes, also pass --nodes and a partition whose GPU range covers the total
+# (8gpus allows at most 8 GPUs; 32gpus takes 17-32). --mem and --cpus-per-task are per
+# node. One torchrun starts on each node and they meet at the first node:
+#
+#   sbatch --partition=32gpus --nodes=4 --gpus-per-node=H200:8 --cpus-per-task=96 \
+#       --mem=1000G --time=... scripts/train.sbatch ...
+#
 # H200-hours = GPUs x wall time, so --time is what bounds the grant a run can use.
 # S3 keys come from the flock AWS profile, which renews them, so --time is not bound
 # by a key's lifetime. Set it up once on the cluster with `flock s3 configure`
@@ -24,7 +31,7 @@
 #SBATCH --account=ACD115198
 #SBATCH --partition=8gpus
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=H200:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=200G
@@ -60,9 +67,39 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 # One task per node; torchrun forks a rank per GPU and sets RANK/LOCAL_RANK/WORLD_SIZE,
 # which train.py's setup_distributed reads. With one GPU it runs a single rank
 export PYTHONUNBUFFERED=1
-# NCCL's bootstrap otherwise picks the IPoIB interface (ibp*), where connecting to
-# the node's own address never completes, so init hangs with idle GPUs. --standalone
-# keeps every rank on this node, so loopback is enough
-export NCCL_SOCKET_IFNAME=lo
-srun uv run --frozen torchrun --standalone --nproc_per_node="$SLURM_GPUS_ON_NODE" \
-    train.py "$@"
+
+if [[ "$SLURM_NNODES" -eq 1 ]]; then
+    # NCCL's bootstrap otherwise picks the IPoIB interface (ibp*), where connecting to
+    # the node's own address never completes, so init hangs with idle GPUs. --standalone
+    # keeps every rank on this node, so loopback is enough
+    export NCCL_SOCKET_IFNAME=lo
+    srun uv run --frozen torchrun --standalone --nproc_per_node="$SLURM_GPUS_ON_NODE" \
+        train.py "$@"
+    exit
+fi
+
+# Several nodes: the ranks meet at the first node's torchrun (static rendezvous).
+# Its hostname resolves to the node's vlan1721 address, so the TCPStore and NCCL's
+# bootstrap both use vlan1721 (Ethernet) and never touch IPoIB
+MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+MASTER_PORT=$((15000 + SLURM_JOB_ID % 40000))
+export MASTER_ADDR MASTER_PORT
+export NCCL_SOCKET_IFNAME=vlan1721
+# Gradients go over the 8 InfiniBand NDR HCAs, one PCIe-local to each GPU. mlx5_1 and
+# mlx5_2 are the RoCE ports under bond0, which NCCL would otherwise also list. The
+# leading = makes the names exact matches rather than prefixes
+export NCCL_IB_HCA==mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9
+# Print the chosen transports once; check for "via NET/IB/.../GDRDMA" in the log
+export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET
+echo "nodes $SLURM_JOB_NODELIST, master $MASTER_ADDR:$MASTER_PORT"
+
+# The single quotes defer $SLURM_NODEID and $SLURM_GPUS_ON_NODE to each node's task;
+# expanded here they would be the first node's values on every node. train.py's
+# arguments follow as "$@" after the placeholder $0 (_). --kill-on-bad-exit stops the
+# whole job when one node fails instead of leaving the others blocked in a collective.
+# --no-sync keeps the nodes from syncing the shared .venv at the same time
+srun --kill-on-bad-exit=1 bash -c 'exec uv run --frozen --no-sync torchrun \
+    --nnodes="$SLURM_NNODES" --nproc_per_node="$SLURM_GPUS_ON_NODE" \
+    --node_rank="$SLURM_NODEID" \
+    --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
+    train.py "$@"' _ "$@"
