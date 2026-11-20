@@ -1,7 +1,7 @@
 import contextlib
 import dataclasses
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -15,9 +15,9 @@ from transformers import PreTrainedModel
 from transformers.utils.generic import is_flash_attention_requested
 
 from .data import Batch, Stateful
-from .hooks import TrainerHook
 from .loss import CausalLMLossSum
 from .param_stats import ParameterStats
+from .stops import StopCondition
 
 # Positions of the first micro batch whose logsumexp is logged. The fused loss returns
 # the logsumexp of every position for free; the sample keeps the metric as before
@@ -183,7 +183,7 @@ class Trainer:
         logger: Logger,
         cfg: TrainingConfig,
         data_stats: Callable[[], dict[str, int]] | None = None,
-        hooks: Sequence[TrainerHook] = (),
+        stop: StopCondition | None = None,
     ) -> None:
         # Note we do not perform any validation here, since we already do it in the config
         self.model = model
@@ -218,9 +218,9 @@ class Trainer:
         # The global data counters as of the last log step
         self.data_metrics: dict[str, float] = {}
         self.state = TrainerState()
-        # Every rank must get the same hooks: whether a step syncs the stop decision
-        # depends on there being any
-        self.hooks = list(hooks)
+        # Every rank must get the same stop: whether a step syncs the stop decision
+        # depends on there being one
+        self.stop = stop
         # Why the last train() ended before total_tokens, None if it ran to the end
         self.stop_reason: str | None = None
         # DDP raises on parameters that get no gradient, so every one of these has a grad
@@ -238,8 +238,8 @@ class Trainer:
         # float64: token counts reach 1e10, past where float32 holds integers exactly
         log_stats = torch.zeros(5, dtype=torch.float64, device=device)
         log_start_time = time.monotonic()
-        # Stop reasons the hooks gave this step, rank 0 only
-        stop_reasons: list[str] = []
+        # Every metric logged this step, for the stop. Rank 0 only
+        step_metrics: dict[str, float] = {}
         self.stop_reason = None
 
         while self.state.tokens_seen < self.cfg.total_tokens:
@@ -392,7 +392,7 @@ class Trainer:
                         metrics[f"train/learning_rate/{name}"] = group["lr"]
 
                     self.logger.log(metrics, step=self.state.step)
-                    stop_reasons += self._run_hooks("on_log", metrics)
+                    step_metrics.update(metrics)
 
                 log_stats.zero_()
                 log_start_time = time.monotonic()
@@ -408,20 +408,23 @@ class Trainer:
                     result = self.evaluator(self.raw_model)
                     if self.rank == 0:
                         self.logger.log(result.metrics, step=self.state.step)
-                        stop_reasons += self._run_hooks("on_eval", result.metrics)
+                        step_metrics.update(result.metrics)
                 # Don't count eval time as training throughput
                 log_start_time = time.monotonic()
 
-            # Hooks only run on log and eval steps, so only those need the decision
+            # The stop is checked on log and eval steps only, so only those need the
+            # decision; a run without a stop never syncs it
             should_stop = False
-            if self.hooks and (is_log_step or is_eval_step) and not is_last_step:
-                should_stop = self._sync_stop(bool(stop_reasons))
-            if should_stop:
-                # The reasons are text, so only rank 0 has them
-                self.stop_reason = (
-                    "; ".join(stop_reasons) or "stopped by rank 0's hooks"
-                )
-            stop_reasons = []
+            is_stop_check = (is_log_step or is_eval_step) and not is_last_step
+            if self.stop is not None and is_stop_check:
+                reason = None
+                if self.rank == 0:
+                    reason = self.stop(self.state, step_metrics)
+                should_stop = self._sync_stop(reason is not None)
+                if should_stop:
+                    # The reason is text, so only rank 0 has it
+                    self.stop_reason = reason or "stopped by rank 0's stop"
+            step_metrics = {}
 
             # Checkpoints are saved on rank 0 only, the other ranks wait at the barrier.
             # An early stop saves one too, so the stopped model is kept and can resume
@@ -493,21 +496,9 @@ class Trainer:
         cast(Stateful, self.train_data).load_state_dict(state["data"][self.rank])
         self.state = TrainerState(**state["trainer"])
 
-    def _run_hooks(self, event: str, metrics: dict[str, float]) -> list[str]:
-        """
-        Call event ("on_log" or "on_eval") on every hook, returning the stop reasons.
-        Every hook runs, even after one asks to stop, so each sees every metric
-        """
-        reasons = []
-        for hook in self.hooks:
-            reason = getattr(hook, event)(self.state, metrics)
-            if reason is not None:
-                reasons.append(reason)
-        return reasons
-
     def _sync_stop(self, stop: bool) -> bool:
         """
-        Rank 0's decision, on every rank. Only rank 0 runs the hooks, and a rank that
+        Rank 0's decision, on every rank. Only rank 0 checks the stop, and a rank that
         stopped alone would leave the others waiting in the next collective forever
         """
         flag = torch.tensor([float(stop)], device=self.device)

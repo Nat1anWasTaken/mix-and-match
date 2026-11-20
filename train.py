@@ -12,13 +12,13 @@ import torch
 from src.checkpoint import PretrainedCheckpointer
 from src.data import PackedDataLoader, SequencePacker
 from src.evaluation import FlockEvaluator, parse_eval_spec
-from src.hooks import parse_stop_condition
 from src.loggers import ConsoleLogger, WandbLogger
 from src.loss import LinearCrossEntropySum
 from src.model import LlamaCausalLM, ScalingLlamaConfig
 from src.optimizer import build_muon_adamw, build_warmup_stable_decay
 from src.recipe.cache import localize_recipe
 from src.recipe.recipe import load_recipe
+from src.stops import add_stop_arguments, available_stops, build_stop
 from src.token_stream import RecipeTokenStream
 from src.tokenizer import load_tokenizer
 from src.trainer import Trainer, TrainingConfig
@@ -146,14 +146,10 @@ def parse_arguments() -> argparse.Namespace:
         help="score only each task's first N docs, for debug runs (default: all)",
     )
     parser.add_argument(
-        "--stop-when",
-        action="append",
-        default=[],
-        metavar="METRIC<=VALUE",
-        help="repeatable: end training early, with a checkpoint, once a logged metric "
-        "crosses VALUE (<=, <, >=, >), e.g. "
-        "--stop-when 'eval/paloma@val/macro/bits_per_byte<=1.15'. eval/... metrics are "
-        "checked after each eval, so --eval-every-steps sets how soon a stop is seen",
+        "--stop",
+        choices=available_stops(),
+        help="end training early, with a checkpoint, once this src/stops/ rule asks "
+        "to. Each stop takes flags of its own; --stop NAME --help lists them",
     )
     parser.add_argument(
         "--ckpt-every-steps", type=int, help="default: about every 5%% of training"
@@ -206,6 +202,14 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
 
+    # The stop adds flags of its own, so it is read first. An unknown name is left to
+    # the full parser, whose choices name the known ones
+    stop_parser = argparse.ArgumentParser(add_help=False)
+    stop_parser.add_argument("--stop")
+    stop = stop_parser.parse_known_args()[0].stop
+    if stop in available_stops():
+        add_stop_arguments(parser, stop)
+
     arguments = parser.parse_args()
 
     # No default: which eval a run is judged by is a choice each run makes
@@ -222,11 +226,10 @@ def parse_arguments() -> argparse.Namespace:
             parser.error(str(error))
     if arguments.eval_limit is not None and arguments.eval_limit < 1:
         parser.error("--eval-limit must be at least 1")
-    for text in arguments.stop_when:
-        try:
-            parse_stop_condition(text)
-        except ValueError as error:
-            parser.error(str(error))
+    try:
+        build_stop(arguments)
+    except ValueError as error:
+        parser.error(str(error))
 
     return arguments
 
@@ -550,7 +553,7 @@ def main() -> None:
         logger=logger,
         cfg=training_config,
         data_stats=documents.stats,
-        hooks=[parse_stop_condition(text) for text in arguments.stop_when],
+        stop=build_stop(arguments),
     )
 
     if resume_from is not None:
