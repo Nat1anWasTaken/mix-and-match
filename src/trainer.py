@@ -1,7 +1,7 @@
 import contextlib
 import dataclasses
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -15,6 +15,7 @@ from transformers import PreTrainedModel
 from transformers.utils.generic import is_flash_attention_requested
 
 from .data import Batch, Stateful
+from .hooks import TrainerHook
 from .loss import CausalLMLossSum
 from .param_stats import ParameterStats
 
@@ -182,6 +183,7 @@ class Trainer:
         logger: Logger,
         cfg: TrainingConfig,
         data_stats: Callable[[], dict[str, int]] | None = None,
+        hooks: Sequence[TrainerHook] = (),
     ) -> None:
         # Note we do not perform any validation here, since we already do it in the config
         self.model = model
@@ -216,6 +218,11 @@ class Trainer:
         # The global data counters as of the last log step
         self.data_metrics: dict[str, float] = {}
         self.state = TrainerState()
+        # Every rank must get the same hooks: whether a step syncs the stop decision
+        # depends on there being any
+        self.hooks = list(hooks)
+        # Why the last train() ended before total_tokens, None if it ran to the end
+        self.stop_reason: str | None = None
         # DDP raises on parameters that get no gradient, so every one of these has a grad
         self.params = [p for p in self.raw_model.parameters() if p.requires_grad]
         # Gradients match on every rank after the all-reduce, so only rank 0 measures them
@@ -231,6 +238,9 @@ class Trainer:
         # float64: token counts reach 1e10, past where float32 holds integers exactly
         log_stats = torch.zeros(5, dtype=torch.float64, device=device)
         log_start_time = time.monotonic()
+        # Stop reasons the hooks gave this step, rank 0 only
+        stop_reasons: list[str] = []
+        self.stop_reason = None
 
         while self.state.tokens_seen < self.cfg.total_tokens:
             self.optimizer.zero_grad()
@@ -382,6 +392,7 @@ class Trainer:
                         metrics[f"train/learning_rate/{name}"] = group["lr"]
 
                     self.logger.log(metrics, step=self.state.step)
+                    stop_reasons += self._run_hooks("on_log", metrics)
 
                 log_stats.zero_()
                 log_start_time = time.monotonic()
@@ -389,18 +400,47 @@ class Trainer:
             # Every rank evaluates its share of the eval tasks with the unwrapped model,
             # since the DDP wrapper would broadcast buffers on every forward. The
             # evaluator's gather already syncs the ranks, so eval needs no barrier
-            if self.state.step % self.cfg.eval_every_steps == 0 or is_last_step:
+            is_eval_step = (
+                self.state.step % self.cfg.eval_every_steps == 0 or is_last_step
+            )
+            if is_eval_step:
                 if self.evaluator is not None:
                     result = self.evaluator(self.raw_model)
                     if self.rank == 0:
                         self.logger.log(result.metrics, step=self.state.step)
+                        stop_reasons += self._run_hooks("on_eval", result.metrics)
                 # Don't count eval time as training throughput
                 log_start_time = time.monotonic()
 
-            # Checkpoints are saved on rank 0 only, the other ranks wait at the barrier
-            if self.state.step % self.cfg.ckpt_every_steps == 0 or is_last_step:
+            # Hooks only run on log and eval steps, so only those need the decision
+            should_stop = False
+            if self.hooks and (is_log_step or is_eval_step) and not is_last_step:
+                should_stop = self._sync_stop(bool(stop_reasons))
+            if should_stop:
+                # The reasons are text, so only rank 0 has them
+                self.stop_reason = (
+                    "; ".join(stop_reasons) or "stopped by rank 0's hooks"
+                )
+            stop_reasons = []
+
+            # Checkpoints are saved on rank 0 only, the other ranks wait at the barrier.
+            # An early stop saves one too, so the stopped model is kept and can resume
+            if (
+                self.state.step % self.cfg.ckpt_every_steps == 0
+                or is_last_step
+                or should_stop
+            ):
                 self.save_checkpoint()
                 log_start_time = time.monotonic()
+
+            if should_stop:
+                if self.rank == 0:
+                    print(
+                        f"early stop at step {self.state.step} "
+                        f"({self.state.tokens_seen:,} tokens): {self.stop_reason}",
+                        flush=True,
+                    )
+                break
 
     def save_checkpoint(self) -> None:
         """
@@ -452,6 +492,28 @@ class Trainer:
         self.scheduler.load_state_dict(state["scheduler"])
         cast(Stateful, self.train_data).load_state_dict(state["data"][self.rank])
         self.state = TrainerState(**state["trainer"])
+
+    def _run_hooks(self, event: str, metrics: dict[str, float]) -> list[str]:
+        """
+        Call event ("on_log" or "on_eval") on every hook, returning the stop reasons.
+        Every hook runs, even after one asks to stop, so each sees every metric
+        """
+        reasons = []
+        for hook in self.hooks:
+            reason = getattr(hook, event)(self.state, metrics)
+            if reason is not None:
+                reasons.append(reason)
+        return reasons
+
+    def _sync_stop(self, stop: bool) -> bool:
+        """
+        Rank 0's decision, on every rank. Only rank 0 runs the hooks, and a rank that
+        stopped alone would leave the others waiting in the next collective forever
+        """
+        flag = torch.tensor([float(stop)], device=self.device)
+        if torch.distributed.is_initialized():
+            torch.distributed.broadcast(flag, src=0)
+        return bool(flag.item())
 
     def _gather_data_stats(self) -> dict[str, float]:
         if self.data_stats is None:

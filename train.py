@@ -12,6 +12,7 @@ import torch
 from src.checkpoint import PretrainedCheckpointer
 from src.data import PackedDataLoader, SequencePacker
 from src.evaluation import FlockEvaluator, parse_eval_spec
+from src.hooks import parse_stop_condition
 from src.loggers import ConsoleLogger, WandbLogger
 from src.loss import LinearCrossEntropySum
 from src.model import LlamaCausalLM, ScalingLlamaConfig
@@ -145,6 +146,16 @@ def parse_arguments() -> argparse.Namespace:
         help="score only each task's first N docs, for debug runs (default: all)",
     )
     parser.add_argument(
+        "--stop-when",
+        action="append",
+        default=[],
+        metavar="METRIC<=VALUE",
+        help="repeatable: end training early, with a checkpoint, once a logged metric "
+        "crosses VALUE (<=, <, >=, >), e.g. "
+        "--stop-when 'eval/paloma@val/macro/bits_per_byte<=1.15'. eval/... metrics are "
+        "checked after each eval, so --eval-every-steps sets how soon a stop is seen",
+    )
+    parser.add_argument(
         "--ckpt-every-steps", type=int, help="default: about every 5%% of training"
     )
     parser.add_argument(
@@ -211,6 +222,11 @@ def parse_arguments() -> argparse.Namespace:
             parser.error(str(error))
     if arguments.eval_limit is not None and arguments.eval_limit < 1:
         parser.error("--eval-limit must be at least 1")
+    for text in arguments.stop_when:
+        try:
+            parse_stop_condition(text)
+        except ValueError as error:
+            parser.error(str(error))
 
     return arguments
 
@@ -534,6 +550,7 @@ def main() -> None:
         logger=logger,
         cfg=training_config,
         data_stats=documents.stats,
+        hooks=[parse_stop_condition(text) for text in arguments.stop_when],
     )
 
     if resume_from is not None:
@@ -558,6 +575,8 @@ def main() -> None:
         )
         total_tokens = trainer.state.tokens_seen
         logger.run.summary["total_tokens"] = total_tokens
+        if trainer.stop_reason is not None:
+            logger.run.summary["stop_reason"] = trainer.stop_reason
         logger.run.summary["oj_total_tokens"] = oj_counted_tokens(
             total_tokens, repeated_share
         )
