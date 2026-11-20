@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import json
 import logging
 import math
 import os
@@ -10,20 +11,22 @@ import torch
 
 from src.checkpoint import PretrainedCheckpointer
 from src.data import PackedDataLoader, SequencePacker
-from src.evaluation import DevelopmentEvaluator, load_development_texts
+from src.evaluation import FlockEvaluator, parse_eval_spec
 from src.loggers import ConsoleLogger, WandbLogger
 from src.loss import LinearCrossEntropySum
 from src.model import LlamaCausalLM, ScalingLlamaConfig
 from src.optimizer import build_muon_adamw, build_warmup_stable_decay
+from src.recipe.cache import localize_recipe
 from src.recipe.recipe import load_recipe
 from src.token_stream import RecipeTokenStream
 from src.tokenizer import load_tokenizer
-from src.trainer import Trainer, TrainingConfig, barrier
+from src.trainer import Trainer, TrainingConfig
 
 TOKENIZER_NAME = "meta-llama/Llama-3.2-1B"
-DEVELOPMENT_DATASET = "cerulean-works/fineweb-edu-dev"
 WANDB_PROJECT = "lab7-data-curation"
 VOCAB_SIZE = 128256
+# Lab 7: repeats of up to this fraction of the training data don't count toward the score
+FREE_REPEAT_FRACTION = 0.1
 
 
 DistributedData = namedtuple("DistributedData", ["rank", "world_size", "device"])
@@ -78,6 +81,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--recipe", required=True, help="compiled recipe directory from src/recipe/"
     )
+    parser.add_argument(
+        "--recipe-cache",
+        type=Path,
+        help="read the recipe and its shards from this local copy, made by "
+        "python -m src.recipe.cache, instead of S3. Same data in the same order; "
+        "the run still logs the S3 --recipe URI",
+    )
     parser.add_argument("--model-size", choices=MODEL_SIZES, required=True)
     parser.add_argument("--total-tokens", type=int, required=True)
     parser.add_argument("--seq-len", type=int, default=4096)
@@ -120,7 +130,20 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--eval-every-steps", type=int, help="default: every 10%% of training"
     )
-    parser.add_argument("--eval-max-batches", type=int, help="default: whole dev set")
+    parser.add_argument(
+        "--eval",
+        action="append",
+        default=[],
+        metavar="NAME[@SPLIT]",
+        help="required, repeatable: a flock suite or task to score at every eval, by its "
+        "flock.eval.tasks registry name (as `flock eval run --suite/--task` takes it), "
+        "on its own split or on SPLIT, e.g. --eval paloma@val or --eval paloma (test)",
+    )
+    parser.add_argument(
+        "--eval-limit",
+        type=int,
+        help="score only each task's first N docs, for debug runs (default: all)",
+    )
     parser.add_argument(
         "--ckpt-every-steps", type=int, help="default: about every 5%% of training"
     )
@@ -128,6 +151,14 @@ def parse_arguments() -> argparse.Namespace:
         "--resume",
         action="store_true",
         help="continue from the newest checkpoint in the run's checkpoint directory",
+    )
+    parser.add_argument(
+        "--init-from",
+        type=Path,
+        help="start this new run from another run's checkpoint (a step-N directory): "
+        "model, optimizer, schedule step, data stream and tokens_seen all carry over, "
+        "under this run's own name. For WSD decay branches off a stable-phase checkpoint. "
+        "Once the run holds checkpoints of its own, --resume continues those instead",
     )
 
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints"))
@@ -143,7 +174,6 @@ def parse_arguments() -> argparse.Namespace:
         help="model init; the data order comes from the recipe's own seed",
     )
     parser.add_argument("--tokenizer", default=TOKENIZER_NAME)
-    parser.add_argument("--development-dataset", default=DEVELOPMENT_DATASET)
     parser.add_argument("--device", help="default: cuda, else mps, else cpu")
     parser.add_argument(
         "--compile",
@@ -165,7 +195,36 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
 
-    return parser.parse_args()
+    arguments = parser.parse_args()
+
+    # No default: which eval a run is judged by is a choice each run makes
+    if not arguments.eval:
+        parser.error(
+            "--eval is required: name the flock suite or task to score during training, "
+            "e.g. --eval paloma@val (Paloma's val split) or --eval paloma (its test "
+            "split, what `flock eval run --suite paloma` scores)"
+        )
+    for text in arguments.eval:
+        try:
+            parse_eval_spec(text)
+        except ValueError as error:
+            parser.error(str(error))
+    if arguments.eval_limit is not None and arguments.eval_limit < 1:
+        parser.error("--eval-limit must be at least 1")
+
+    return arguments
+
+
+def oj_counted_tokens(total_tokens: int, repeated_share: float) -> int:
+    """
+    oj_total_tokens: the trained tokens minus the repeats that are free, which are at
+    most FREE_REPEAT_FRACTION of the unrepeated data. LAB.md's example: 220B trained, 20B
+    of them repeats, counts 200B; 230B with 30B repeats counts 210B, since only 20B of
+    the 30B are free
+    """
+    repeated = total_tokens * repeated_share
+    free = min(repeated, FREE_REPEAT_FRACTION * (total_tokens - repeated))
+    return round(total_tokens - free)
 
 
 def default_ckpt_every_steps(total_steps: int, log_every_steps: int) -> int:
@@ -184,6 +243,46 @@ def pick_device(requested: str | None) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def scheduler_decay_start(total_steps: int, decay_fraction: float) -> int:
+    """The first step of the WSD decay, as build_warmup_stable_decay computes it"""
+    return total_steps - max(1, math.ceil(total_steps * decay_fraction))
+
+
+def check_branch_point(
+    checkpoint: Path, total_steps: int, tokens_per_step: int, decay_start: int
+) -> None:
+    """
+    Refuse an --init-from checkpoint this run's schedule can't continue smoothly.
+
+    The LR multiplier depends only on the step, so a checkpoint taken while the source
+    run's LR was constant (after warmup, before its decay) continues exactly as if this
+    run had been that long from the start, provided this run's decay starts at or after
+    the checkpoint's step: the multiplier is 1.0 up to decay_start either way
+    """
+    state_path = checkpoint / "trainer_state.json"
+    if not (checkpoint / "resume.pt").is_file() or not state_path.is_file():
+        raise FileNotFoundError(f"--init-from {checkpoint} is not a step-N checkpoint")
+
+    state = json.loads(state_path.read_text())
+    step, tokens_seen = state["step"], state["tokens_seen"]
+    if tokens_seen != step * tokens_per_step:
+        raise ValueError(
+            f"--init-from {checkpoint}: {tokens_seen:,} tokens in {step} steps is not "
+            f"{tokens_per_step:,} per step; use the source run's --global-batch-tokens"
+        )
+    if step >= total_steps:
+        raise ValueError(
+            f"--init-from {checkpoint} is at step {step}, not before this run's last "
+            f"step {total_steps}"
+        )
+    if step > decay_start:
+        raise ValueError(
+            f"--init-from {checkpoint} is at step {step}, after this run's decay starts "
+            f"(step {decay_start}): the LR would jump down at the branch. Lower "
+            "--decay-fraction or raise --total-tokens"
+        )
 
 
 def build_model_config(
@@ -317,8 +416,10 @@ def main() -> None:
             8, 2 * model_config.num_hidden_layers + 4
         )
         training_model.compile()
-        # eval runs on the unwrapped model, which the DDP compile above
-        # doesn't cover. Compile it too, so eval uses the same kernels as on 1 GPU
+        # The unwrapped model, which the DDP compile above doesn't cover, was compiled for
+        # eval. Eval no longer goes through it (TrainingScorer calls model.forward,
+        # uncompiled), but DDP's forward calls the module, so it is left as it was rather
+        # than risk changing how training traces
         if training_model is not model:
             model.compile()
 
@@ -340,32 +441,34 @@ def main() -> None:
             f"not {arguments.tokenizer}"
         )
 
+    # Where the recipe came from, for the run's config, even when read from the cache
+    recipe_uri = recipe.uri
+    if arguments.recipe_cache is not None:
+        recipe = localize_recipe(recipe, arguments.recipe_cache)
+        if rank == 0:
+            print(f"recipe: reading {recipe_uri} from {recipe.uri}")
+
     # The stream shards documents across ranks before packing, so each rank only
     # packs its own 1/world_size
     documents = RecipeTokenStream(recipe, rank=rank, world_size=world_size)
     rows = SequencePacker(documents, arguments.seq_len)
     train_data = PackedDataLoader(rows, arguments.micro_batch_size)
 
-    # Every rank evaluates its share of the dev set, so every rank needs an evaluator:
-    # a rank without one would skip the eval all-reduce and hang the others.
-    # Rank 0 downloads the dev set first, so the other ranks read it from the HF cache
-    if rank == 0:
-        load_development_texts(arguments.development_dataset)
-    barrier()
-    evaluator = DevelopmentEvaluator(
+    # Every rank scores its share of the eval tasks, so every rank needs an evaluator:
+    # a rank without one would skip the eval gather and hang the others
+    evaluator = FlockEvaluator(
+        [parse_eval_spec(text) for text in arguments.eval],
+        model,
         tokenizer,
-        arguments.development_dataset,
-        loss_fn,
-        seq_len=arguments.seq_len,
-        micro_batch_size=arguments.micro_batch_size,
-        max_batches=arguments.eval_max_batches,
+        max_length=arguments.seq_len,
+        limit=arguments.eval_limit,
         rank=rank,
         world_size=world_size,
     )
 
     run_config: dict[str, object] = {
         **vars(arguments),
-        "recipe_uri": recipe.uri,
+        "recipe_uri": recipe_uri,
         "recipe_total_tokens": recipe.total_tokens,
         "recipe_repeated_tokens": recipe.repeated_tokens,
         "recipe_phases": [
@@ -404,6 +507,16 @@ def main() -> None:
             f"{run_dir} already holds {resume_from.name}; pass --resume to continue "
             "it, or pick a new --run-name"
         )
+    # A branch run starts from the other run's checkpoint only until it has its own
+    if resume_from is None and arguments.init_from is not None:
+        resume_from = arguments.init_from
+        check_branch_point(
+            resume_from,
+            total_steps,
+            tokens_per_step,
+            scheduler_decay_start(total_steps, arguments.decay_fraction),
+        )
+        run_config["init_from"] = str(resume_from)
 
     if arguments.no_wandb or rank != 0:
         logger: ConsoleLogger | WandbLogger = ConsoleLogger()
@@ -445,7 +558,9 @@ def main() -> None:
         )
         total_tokens = trainer.state.tokens_seen
         logger.run.summary["total_tokens"] = total_tokens
-        logger.run.summary["oj_total_tokens"] = round(total_tokens * (1 - repeated_share))
+        logger.run.summary["oj_total_tokens"] = oj_counted_tokens(
+            total_tokens, repeated_share
+        )
         logger.finish()
 
     if torch.distributed.is_initialized():

@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
-# Train on one H200. All arguments go straight to train.py:
+# Train on one H200 by default. All arguments go straight to train.py:
 #
 #   mkdir -p logs
 #   sbatch --job-name=150M-baseline scripts/train.sbatch \
-#       --recipe s3://<bucket>/recipes/fwedu-identity-30b --model-size 150M \
-#       --total-tokens 30000000000 --run-name 150M-baseline --compile
+#       --recipe s3://mix-and-match/recipes/dolma-v1_7-30b --model-size 150M \
+#       --total-tokens 30001856512 --eval paloma@val --run-name 150M-baseline
+#
+# --eval is required: the flock suite or task scored during training, by its registry
+# name, optionally on another split (paloma@val; plain paloma is the test split).
+#
+# --total-tokens must be a multiple of --global-batch-tokens (4,194,304 by default),
+# so "30B" is 7153 steps = 30,001,856,512 tokens.
+#
+# For more GPUs on the node, override the resources on the sbatch line. torchrun
+# starts one rank per allocated GPU, so nothing else changes:
+#
+#   sbatch --gpus-per-node=H200:8 --cpus-per-task=96 --mem=1000G --time=04:45:00 ...
 #
 # H200-hours = GPUs x wall time, so --time is what bounds the grant a run can use.
-# S3 keys last at most 8h, so --time must stay below that (default 7:30). Longer runs
-# are chained segments: sbatch --dependency=afterany:<prev> ... --resume
+# S3 keys come from the flock AWS profile, which renews them, so --time is not bound
+# by a key's lifetime. Set it up once on the cluster with `flock s3 configure`
 #SBATCH --job-name=train
 #SBATCH --account=ACD115198
 #SBATCH --partition=8gpus
@@ -32,30 +43,26 @@ export TOKENIZERS_PARALLELISM=false
 export TORCHINDUCTOR_COMPILE_THREADS=4
 export WANDB_MODE="${WANDB_MODE:-online}"
 
-# The data loader reads shards from S3 while training. The key expires after 8h, so
-# refuse a time limit that would outlive it (--time on the command line overrides the
-# default above)
-S3_KEY_TTL_SECONDS=$((8 * 3600))
-time_limit=$(squeue -j "$SLURM_JOB_ID" -h -o %l)
-days=0
-if [[ "$time_limit" == *-* ]]; then
-    days=${time_limit%%-*}
-    time_limit=${time_limit#*-}
-fi
-IFS=: read -r -a parts <<< "$time_limit"
-seconds=0
-for part in "${parts[@]}"; do
-    seconds=$((seconds * 60 + 10#$part))
-done
-seconds=$((seconds + days * 86400))
-if ((seconds >= S3_KEY_TTL_SECONDS)); then
-    echo "time limit $(squeue -j "$SLURM_JOB_ID" -h -o %l) is not below the 8h S3 key" >&2
-    exit 1
-fi
-eval "$(flock s3 credentials --ttl 8h)"
+# The data loader reads shards from S3 while training. A key from `flock s3
+# credentials` in AWS_* variables would expire mid-run, so use the flock profile
+# instead: its credential_process lets pyarrow's S3 client fetch a new key when the old
+# one expires. The AWS SDK prefers keys in the environment, so none may be set
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+export AWS_PROFILE=flock
+# pyarrow takes the keys from the profile but ignores its endpoint_url, and without
+# an endpoint it asks AWS for the bucket ("Bucket ... not found")
+export AWS_ENDPOINT_URL=https://s3.flock.cerulean.works
 
 echo "job $SLURM_JOB_ID on $(hostname), GPU $CUDA_VISIBLE_DEVICES, commit $(git rev-parse --short HEAD)"
 echo "args: $*"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-srun uv run --frozen python -u train.py "$@"
+# One task per node; torchrun forks a rank per GPU and sets RANK/LOCAL_RANK/WORLD_SIZE,
+# which train.py's setup_distributed reads. With one GPU it runs a single rank
+export PYTHONUNBUFFERED=1
+# NCCL's bootstrap otherwise picks the IPoIB interface (ibp*), where connecting to
+# the node's own address never completes, so init hangs with idle GPUs. --standalone
+# keeps every rank on this node, so loopback is enough
+export NCCL_SOCKET_IFNAME=lo
+srun uv run --frozen torchrun --standalone --nproc_per_node="$SLURM_GPUS_ON_NODE" \
+    train.py "$@"

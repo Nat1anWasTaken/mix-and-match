@@ -95,7 +95,10 @@ def source_dataset(store: ShardStore) -> tuple[str, int]:
     if metadata is None:
         raise FileNotFoundError(f"no metadata.json in {store.uri}")
 
-    if metadata.get("layout") != 2:
+    # Check for the file itself, not metadata's layout: layout is prepare.py's resume
+    # fingerprint and changes with how shards are made, even when they still carry row_ids.
+    # Every shard of a store is made with the same settings, so the first one tells
+    if not store.has_row_ids(read_shard_names(store)[0]):
         raise ValueError(f"{store.uri} has no row_ids; rerun prepare.py")
 
     version = metadata["dataset_version"]

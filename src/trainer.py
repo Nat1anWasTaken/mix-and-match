@@ -62,12 +62,13 @@ class TrainerState:
 
 @dataclass
 class EvaluationResult:
-    loss: float
-    perplexity: float
+    # eval/... metrics to log. Only rank 0's are complete; the other ranks return {}
+    metrics: dict[str, float]
 
 
 class Evaluator(Protocol):
-    # The eval data and loss fn should be put into the evaluator when intialized
+    # The eval data should be put into the evaluator when initialized. Every rank calls
+    # it at every eval, since the ranks share the work and meet in a collective
     def __call__(
         self,
         model: PreTrainedModel,
@@ -385,20 +386,14 @@ class Trainer:
                 log_stats.zero_()
                 log_start_time = time.monotonic()
 
-            # Every rank evaluates its share of the dev set with the unwrapped model, since
-            # the DDP wrapper would broadcast buffers on every forward. The evaluator's
-            # all-reduce already syncs the ranks, so eval needs no barrier
+            # Every rank evaluates its share of the eval tasks with the unwrapped model,
+            # since the DDP wrapper would broadcast buffers on every forward. The
+            # evaluator's gather already syncs the ranks, so eval needs no barrier
             if self.state.step % self.cfg.eval_every_steps == 0 or is_last_step:
                 if self.evaluator is not None:
                     result = self.evaluator(self.raw_model)
                     if self.rank == 0:
-                        self.logger.log(
-                            {
-                                "eval/loss": result.loss,
-                                "eval/perplexity": result.perplexity,
-                            },
-                            step=self.state.step,
-                        )
+                        self.logger.log(result.metrics, step=self.state.step)
                 # Don't count eval time as training throughput
                 log_start_time = time.monotonic()
 
