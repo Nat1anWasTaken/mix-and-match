@@ -16,6 +16,7 @@ from src.loggers import ConsoleLogger, WandbLogger
 from src.loss import LinearCrossEntropySum
 from src.model import LlamaCausalLM, ScalingLlamaConfig
 from src.optimizer import build_muon_adamw, build_warmup_stable_decay
+from src.recipe.cache import localize_recipe
 from src.recipe.recipe import load_recipe
 from src.token_stream import RecipeTokenStream
 from src.tokenizer import load_tokenizer
@@ -79,6 +80,13 @@ def parse_arguments() -> argparse.Namespace:
 
     parser.add_argument(
         "--recipe", required=True, help="compiled recipe directory from src/recipe/"
+    )
+    parser.add_argument(
+        "--recipe-cache",
+        type=Path,
+        help="read the recipe and its shards from this local copy, made by "
+        "python -m src.recipe.cache, instead of S3. Same data in the same order; "
+        "the run still logs the S3 --recipe URI",
     )
     parser.add_argument("--model-size", choices=MODEL_SIZES, required=True)
     parser.add_argument("--total-tokens", type=int, required=True)
@@ -433,6 +441,13 @@ def main() -> None:
             f"not {arguments.tokenizer}"
         )
 
+    # Where the recipe came from, for the run's config, even when read from the cache
+    recipe_uri = recipe.uri
+    if arguments.recipe_cache is not None:
+        recipe = localize_recipe(recipe, arguments.recipe_cache)
+        if rank == 0:
+            print(f"recipe: reading {recipe_uri} from {recipe.uri}")
+
     # The stream shards documents across ranks before packing, so each rank only
     # packs its own 1/world_size
     documents = RecipeTokenStream(recipe, rank=rank, world_size=world_size)
@@ -453,7 +468,7 @@ def main() -> None:
 
     run_config: dict[str, object] = {
         **vars(arguments),
-        "recipe_uri": recipe.uri,
+        "recipe_uri": recipe_uri,
         "recipe_total_tokens": recipe.total_tokens,
         "recipe_repeated_tokens": recipe.repeated_tokens,
         "recipe_phases": [
