@@ -26,7 +26,7 @@
 # flock eval run wants a new or empty --out, so a rerun needs that directory moved away first
 #SBATCH --job-name=eval
 #SBATCH --account=ACD115198
-#SBATCH --partition=8gpus
+#SBATCH --partition=h200_256gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=H200:1

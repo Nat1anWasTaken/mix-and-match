@@ -17,11 +17,13 @@
 #
 #   sbatch --gpus-per-node=H200:8 --cpus-per-task=96 --mem=1000G --time=04:45:00 ...
 #
-# For several nodes, also pass --nodes and a partition whose GPU range covers the total
-# (8gpus allows at most 8 GPUs; 32gpus takes 17-32). --mem and --cpus-per-task are per
-# node. One torchrun starts on each node and they meet at the first node:
+# For several nodes, also pass --nodes. h200_256gpu is our project's own partition: it
+# takes any GPU count up to the account's 256 (shared with the team, so check
+# `squeue -a -p h200_256gpu` first) and has no wall-time limit. --mem and
+# --cpus-per-task are per node. One torchrun starts on each node and they meet at the
+# first node:
 #
-#   sbatch --partition=32gpus --nodes=4 --gpus-per-node=H200:8 --cpus-per-task=96 \
+#   sbatch --nodes=4 --gpus-per-node=H200:8 --cpus-per-task=96 \
 #       --mem=1000G --time=... scripts/train.sbatch ...
 #
 # H200-hours = GPUs x wall time, so --time is what bounds the grant a run can use.
@@ -29,7 +31,7 @@
 # by a key's lifetime. Set it up once on the cluster with `flock s3 configure`
 #SBATCH --job-name=train
 #SBATCH --account=ACD115198
-#SBATCH --partition=8gpus
+#SBATCH --partition=h200_256gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=H200:1

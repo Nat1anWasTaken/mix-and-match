@@ -11,7 +11,7 @@
 # The copy needs no GPU, but the H200 partitions require one and allow 12 CPUs per GPU
 #SBATCH --job-name=cache-recipe
 #SBATCH --account=ACD115198
-#SBATCH --partition=8gpus
+#SBATCH --partition=h200_256gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=1
