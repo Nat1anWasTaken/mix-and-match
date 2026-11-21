@@ -420,7 +420,8 @@ def run(
         "--workers",
         type=int,
         default=DEFAULT_WORKERS,
-        help="threads for parallel reads, per level (stores, then shards)",
+        help="threads for parallel reads, per level (stores, then shards), and for "
+        "writing the recipe's selections",
     )
 
     if add_arguments is not None:
@@ -442,7 +443,10 @@ def run(
     compile(context)
 
     recipe = context.builder.write(
-        arguments.output, compiler=record, compiler_source=compiler_source
+        arguments.output,
+        compiler=record,
+        compiler_source=compiler_source,
+        workers=arguments.workers,
     )
     print(context.builder.summary())
 

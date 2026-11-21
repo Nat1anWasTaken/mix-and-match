@@ -441,11 +441,16 @@ class RecipeBuilder:
         uri: str,
         compiler: Mapping[str, Any] | None = None,
         compiler_source: str | None = None,
+        workers: int = 16,
     ) -> Recipe:
         """
         Selections and compiler.py first, recipe.json last as the commit point. A recipe
         names a run's data, so an existing one is never overwritten. compiler is the
-        record for recipe.json, compiler_source the code copied to compiler.py
+        record for recipe.json, compiler_source the code copied to compiler.py.
+
+        Selections are written on workers threads: on S3 each file costs a few
+        requests' latency, so one at a time a recipe of thousands of shards takes most
+        of an hour. Every selection is written before compiler.py and recipe.json
         """
         recipe = dataclasses.replace(
             self.build(), compiler=None if compiler is None else dict(compiler)
@@ -455,11 +460,19 @@ class RecipeBuilder:
         if store.read_json(RECIPE_FILE) is not None:
             raise FileExistsError(f"{store.uri} already holds a recipe; pick a new one")
 
-        for cursor in self.cursors:
-            for shard, documents in cursor.selections.items():
-                store.write_array(
-                    _selection_path(cursor.phase, cursor.name, shard), documents
-                )
+        selections = [
+            (_selection_path(cursor.phase, cursor.name, shard), documents)
+            for cursor in self.cursors
+            for shard, documents in cursor.selections.items()
+        ]
+
+        def write_selection(item: tuple[str, numpy.ndarray]) -> None:
+            store.write_array(*item)
+
+        # list() waits for every write and raises the first error, before the commit
+        # point below
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(write_selection, selections))
 
         if compiler_source is not None:
             store.write_text(COMPILER_FILE, compiler_source)
