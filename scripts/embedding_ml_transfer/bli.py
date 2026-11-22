@@ -158,7 +158,7 @@ def main() -> None:
     source.add_argument("--embedding", type=Path, help=".pt tensor or {'weight': ...}")
     source.add_argument("--hf", help="a HF model whose input embedding to score")
     parser.add_argument("--name", required=True)
-    parser.add_argument("--fake-french", type=Path, required=True)
+    parser.add_argument("--fake-french", type=Path, help="P0-1 table dir; omit to skip fake")
     parser.add_argument("--muse", type=Path, required=True, help="MUSE en-zh.txt")
     parser.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B-Base")
     parser.add_argument("--shuffles", type=int, default=5)
@@ -186,8 +186,12 @@ def main() -> None:
     )
     print("en-zh", json.dumps(report["en-zh"]), flush=True)
 
-    table = numpy.load(arguments.fake_french / "fake_french.npz")
-    if vocab >= BASE_VOCAB + table["members"].size:
+    table = (
+        numpy.load(arguments.fake_french / "fake_french.npz")
+        if arguments.fake_french is not None
+        else None
+    )
+    if table is not None and vocab >= BASE_VOCAB + table["members"].size:
         shifted = table["bli_shifted"].astype(numpy.int64)
         original = table["bli_original"].astype(numpy.int64)
         candidates = numpy.flatnonzero((categories != BAN) & (ids < FIRST_SPECIAL))
