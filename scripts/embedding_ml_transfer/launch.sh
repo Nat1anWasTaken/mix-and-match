@@ -23,7 +23,7 @@ if [[ ! -d $code ]]; then
 fi
 
 cd "$code"
-sbatch --job-name="$name" --nodes="$nodes" --gpus-per-node=H200:8 --cpus-per-task=96 \
+sbatch ${SBATCH_EXTRA:-} --job-name="$name" --nodes="$nodes" --gpus-per-node=H200:8 --cpus-per-task=96 \
     --mem=1000G --time="$hours:00:00" --exclude='25a-hgpn[069,173-176]' \
     --output="$RUNS/logs/$name-%j.out" scripts/train.sbatch \
     --run-name "$name" --output-dir "$RUNS/checkpoints" \
