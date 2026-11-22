@@ -165,6 +165,15 @@ class ShardStore:
 
         self.filesystem.move(str(temporary_path), str(self._path(name)))
 
+    def delete_directory(self, name: str) -> None:
+        """
+        A directory relative to the store root and everything in it, if it exists
+        """
+        path = str(self._path(name))
+
+        if self.filesystem.get_file_info(path).type == pyarrow.fs.FileType.Directory:
+            self.filesystem.delete_dir(path)
+
     # Paths stay PurePosixPath inside the class; the damn pyarrow only accepts str, so
     # convert with str() right at each pyarrow call
 
