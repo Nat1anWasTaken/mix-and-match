@@ -118,6 +118,25 @@ def parse_arguments() -> argparse.Namespace:
         "i.e. plain SP with every multiplier at 1)",
     )
     parser.add_argument("--embedding-multiplier", type=float, default=1.0)
+    parser.add_argument(
+        "--output-multiplier",
+        type=float,
+        default=1.0,
+        help="alpha_out on the logits (tied output side), for frozen donor embeddings",
+    )
+    parser.add_argument(
+        "--donor-embedding",
+        type=Path,
+        help="a .pt holding a [vocab_size, hidden_size] tensor (or a dict with "
+        "'weight') copied into the tied embedding after init, e.g. Oracle_Emb from "
+        "B0-Upper's resume.pt or Qwen3-0.6B-Base's embed_tokens",
+    )
+    parser.add_argument(
+        "--freeze-embeddings",
+        action="store_true",
+        help="don't train the tied embedding (requires_grad False before the optimizer "
+        "is built, so it gets no optimizer state, no weight decay and no all-reduce)",
+    )
     parser.add_argument("--muon-lr", type=float, default=0.02)
     parser.add_argument("--adamw-lr", type=float, default=3e-3)
     parser.add_argument(
@@ -329,6 +348,7 @@ def build_model_config(
     bos_token_id: int,
     eos_token_id: int,
     vocab_size: int = VOCAB_SIZE,
+    output_multiplier: float = 1.0,
 ) -> ScalingLlamaConfig:
     base_size = base_size or size
     return ScalingLlamaConfig(
@@ -336,6 +356,7 @@ def build_model_config(
         base_intermediate_size=base_size.intermediate_size,
         base_num_hidden_layers=base_size.num_layers,
         embedding_multiplier=embedding_multiplier,
+        output_multiplier=output_multiplier,
         vocab_size=vocab_size,
         hidden_size=size.hidden_size,
         intermediate_size=size.intermediate_size,
@@ -352,6 +373,37 @@ def build_model_config(
         bos_token_id=bos_token_id,
         eos_token_id=eos_token_id,
     )
+
+
+def load_donor_embedding(
+    model: LlamaCausalLM, path: Path | None, freeze: bool, rank: int
+) -> None:
+    """
+    Copy a donor into the tied embedding and/or freeze it. Runs after init and before
+    the optimizer, DDP and compile, so a frozen embedding is never an optimizer param
+    """
+    embedding = model.model.embed_tokens.weight
+
+    if path is not None:
+        donor = torch.load(path, map_location="cpu", weights_only=True)
+        if isinstance(donor, dict):
+            donor = donor["weight"]
+        if tuple(donor.shape) != tuple(embedding.shape):
+            raise ValueError(
+                f"--donor-embedding {path} is {tuple(donor.shape)}, the model's "
+                f"embedding {tuple(embedding.shape)}: check --vocab-size and the model size"
+            )
+        with torch.no_grad():
+            embedding.copy_(donor.to(embedding.dtype))
+        if rank == 0:
+            rms = donor.float().pow(2).mean().sqrt().item()
+            print(f"donor embedding: {path} {tuple(donor.shape)}, rms {rms:.4g}")
+
+    if freeze:
+        embedding.requires_grad_(False)
+
+    # The tie must survive both: lm_head is the same Parameter as the embedding
+    assert model.lm_head.weight is model.model.embed_tokens.weight, "tie broken"
 
 
 def main() -> None:
@@ -409,8 +461,12 @@ def main() -> None:
         bos_token_id,
         eos_token_id,
         arguments.vocab_size,
+        arguments.output_multiplier,
     )
     model = LlamaCausalLM(model_config).to(device)
+    load_donor_embedding(
+        model, arguments.donor_embedding, arguments.freeze_embeddings, rank
+    )
 
     # FA3 needs Hopper-class CUDA GPUs, so CPU and MPS debug runs fall back to SDPA
     attn_implementation = arguments.attn_implementation or (

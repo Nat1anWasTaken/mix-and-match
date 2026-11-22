@@ -23,7 +23,11 @@ class CausalLMLossSum(Protocol):
 
 
 def _chunk_step(
-    hidden: Tensor, weight: Tensor, labels: Tensor, compute_grad: bool
+    hidden: Tensor,
+    weight: Tensor,
+    labels: Tensor,
+    compute_grad: bool,
+    compute_grad_weight: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
     """
     Linear + cross entropy for one chunk of C positions, never wider than [C, V].
@@ -53,7 +57,8 @@ def _chunk_step(
     grad_logits = (grad_logits * mask[:, None]).to(hidden.dtype)  # [C, V] bf16
 
     grad_hidden = grad_logits @ weight  # [C, d]
-    grad_weight = grad_logits.T @ hidden  # [V, d]
+    # A frozen (donor) embedding needs no [V, d] gradient: skip that third matmul
+    grad_weight = grad_logits.T @ hidden if compute_grad_weight else None  # [V, d]
     return loss_sum, logsumexp, logit_max, grad_hidden, grad_weight
 
 
@@ -67,6 +72,7 @@ def _chunked(
     labels: Tensor,
     chunk_tokens: int,
     compute_grad: bool,
+    compute_grad_weight: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
     """
     Run chunk_step over the positions chunk by chunk. hidden [N, d], weight [V, d]
@@ -84,19 +90,26 @@ def _chunked(
     grad_hidden = torch.empty_like(hidden) if compute_grad else None
     # fp32 accumulator: each chunk's bf16 grad_weight is rounded once, then summed in fp32
     grad_weight = (
-        torch.zeros_like(weight, dtype=torch.float32) if compute_grad else None
+        torch.zeros_like(weight, dtype=torch.float32)
+        if compute_grad and compute_grad_weight
+        else None
     )
 
     for start in range(0, hidden.size(0), chunk_tokens):
         end = start + chunk_tokens
         chunk_loss, chunk_lse, chunk_max, chunk_grad_h, chunk_grad_w = chunk_step(
-            hidden_c[start:end], weight_c, labels[start:end], compute_grad
+            hidden_c[start:end],
+            weight_c,
+            labels[start:end],
+            compute_grad,
+            compute_grad_weight,
         )
         loss_sum += chunk_loss
         logit_max = torch.maximum(logit_max, chunk_max)
         logsumexps.append(chunk_lse)
-        if grad_hidden is not None and grad_weight is not None:
+        if grad_hidden is not None:
             grad_hidden[start:end] = chunk_grad_h
+        if grad_weight is not None:
             grad_weight += chunk_grad_w
 
     return loss_sum, torch.cat(logsumexps), logit_max, grad_hidden, grad_weight
@@ -119,11 +132,23 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         chunk_tokens: int,
         chunk_step: ChunkStep,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        compute_grad_weight = weight.requires_grad
         loss_sum, logsumexp, logit_max, grad_hidden, grad_weight = _chunked(
-            chunk_step, hidden, weight, labels, chunk_tokens, compute_grad=True
+            chunk_step,
+            hidden,
+            weight,
+            labels,
+            chunk_tokens,
+            compute_grad=True,
+            compute_grad_weight=compute_grad_weight,
         )
-        assert grad_hidden is not None and grad_weight is not None
-        ctx.save_for_backward(grad_hidden, grad_weight.to(weight.dtype))
+        assert grad_hidden is not None
+        ctx.compute_grad_weight = compute_grad_weight
+        if compute_grad_weight:
+            assert grad_weight is not None
+            ctx.save_for_backward(grad_hidden, grad_weight.to(weight.dtype))
+        else:
+            ctx.save_for_backward(grad_hidden)
         ctx.mark_non_differentiable(logsumexp, logit_max)
         return loss_sum, logsumexp, logit_max
 
@@ -133,9 +158,12 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         grad_loss: Tensor,
         _grad_logsumexp: Tensor | None,
         _grad_logit_max: Tensor | None,
-    ) -> tuple[Tensor, Tensor, None, None, None]:
-        grad_hidden, grad_weight = ctx.saved_tensors
+    ) -> tuple[Tensor, Tensor | None, None, None, None]:
         # loss_sum is a scalar, so the chain rule is just a scale (1 for loss_sum.backward())
+        if not ctx.compute_grad_weight:
+            (grad_hidden,) = ctx.saved_tensors
+            return grad_hidden * grad_loss, None, None, None, None
+        grad_hidden, grad_weight = ctx.saved_tensors
         return grad_hidden * grad_loss, grad_weight * grad_loss, None, None, None
 
 
