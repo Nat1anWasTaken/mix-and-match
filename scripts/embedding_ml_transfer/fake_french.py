@@ -355,6 +355,16 @@ def build(arguments: argparse.Namespace) -> None:
         f"{sum(shard['tokens'] for shard in shards):,} tokens",
         flush=True,
     )
+    log_summary(
+        arguments,
+        {
+            **{
+                key: value for key, value in info.items() if not isinstance(value, list)
+            },
+            "store_tokens": sum(shard["tokens"] for shard in shards),
+            "source_tokens": int(manifest.get("total_tokens", 0)),
+        },
+    )
 
     for path in arguments.eval_text:
         texts = [
