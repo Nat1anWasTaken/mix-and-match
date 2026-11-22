@@ -16,10 +16,12 @@ Writes one column, meta/glotlid/, with a structured dtype (one record per docume
 so a single scan gives every number the compilers filter on:
 
     fra_line        max over the document's lines of P(fra_Latn)
+    fra_line_mid    the same, over lines of at least MID_LINE characters only
     fra_line_long   the same, over lines of at least LONG_LINE characters only
     zh_line         max over lines that hold a Han character of P(Chinese): the sum
                     over every *_Hani label (cmn, yue, wuu, lzh, hak, nan, ...), since
                     any Chinese is banned
+    zh_line_mid     the same, lines of at least MID_LINE characters only
     zh_line_long    the same, long lines only
     fra_doc         P(fra_Latn) of the whole document, newlines as spaces
     zh_doc          P(Chinese) of the whole document, 0 if it holds no Han character
@@ -32,8 +34,11 @@ characters are dropped from L_train anyway, by the V_ban token filter (vban_coun
 
 A paragraph is a line: FineWeb and FineWeb-2 keep the page's block structure as
 newlines. Short lines (menu items, a lone "Merci") are where LID is least reliable, so
-both the all-lines and the long-lines maxima are kept; the compiler picks one after
-looking at how many documents each drops (a rescan costs a full pass, a column doesn't).
+the maxima over all lines, lines of >= MID_LINE and lines of >= LONG_LINE characters
+are all kept, as probabilities rather than pass/fail: the compiler picks the line length
+and threshold after looking at how many documents each drops (a rescan costs a full
+pass, a column doesn't). P0-1 first wrote kind glotlid without the MID_LINE fields;
+that kind is kept as written, and this one is written as --kind glotlid_v2.
 
 Probabilities come from the top TOP_K labels; a label outside them counts as 0. The
 TOP_K-th probability bounds what that drops, far below the 0.01 document threshold.
@@ -52,13 +57,16 @@ from .harness import Context, TextScorer, run
 DTYPE = numpy.dtype(
     [
         ("fra_line", numpy.float32),
+        ("fra_line_mid", numpy.float32),
         ("fra_line_long", numpy.float32),
         ("zh_line", numpy.float32),
+        ("zh_line_mid", numpy.float32),
         ("zh_line_long", numpy.float32),
         ("fra_doc", numpy.float32),
         ("zh_doc", numpy.float32),
     ]
 )
+MID_LINE = 20
 LONG_LINE = 50
 TOP_K = 20
 FRENCH = "__label__fra_Latn"
@@ -96,7 +104,7 @@ def probabilities(model: Model, text: str) -> tuple[float, float]:
 
 
 def score_text(model: Model, text: str) -> tuple[float, ...]:
-    fra_line = fra_long = zh_line = zh_long = 0.0
+    fra_line = fra_mid = fra_long = zh_line = zh_mid = zh_long = 0.0
 
     for line in text.split("\n"):
         line = line.strip()
@@ -109,13 +117,17 @@ def score_text(model: Model, text: str) -> tuple[float, ...]:
         fra_line = max(fra_line, french)
         zh_line = max(zh_line, chinese)
 
+        if len(line) >= MID_LINE:
+            fra_mid = max(fra_mid, french)
+            zh_mid = max(zh_mid, chinese)
+
         if len(line) >= LONG_LINE:
             fra_long = max(fra_long, french)
             zh_long = max(zh_long, chinese)
 
     fra_doc, zh_doc = probabilities(model, " ".join(text.split()))
     zh_doc = zh_doc if HAN.search(text) else 0.0
-    return fra_line, fra_long, zh_line, zh_long, fra_doc, zh_doc
+    return fra_line, fra_mid, fra_long, zh_line, zh_mid, zh_long, fra_doc, zh_doc
 
 
 def build(model_path: str) -> Callable[[list[str]], numpy.ndarray]:
@@ -143,6 +155,7 @@ def setup(context: Context) -> TextScorer:
             "scorer": "glotlid",
             # By file name, not path: the same model may sit elsewhere on another host
             "model": model.rsplit("/", 1)[-1],
+            "mid_line": MID_LINE,
             "long_line": LONG_LINE,
             "top_k": TOP_K,
             "chinese_needs_han": True,
