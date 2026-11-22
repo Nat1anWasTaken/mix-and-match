@@ -44,9 +44,12 @@ BASE_VOCAB = 151936
 COVERAGES = [0.99, 0.995, 0.999, 0.9995, 0.9999]
 # ASCII whitespace, digits and punctuation: the anchors every condition shares
 ANCHOR_BYTES = frozenset(
-    b"\t\n\x0b\x0c\r 0123456789" + bytes(range(0x21, 0x30)) + bytes(range(0x3A, 0x41))
-    + bytes(range(0x5B, 0x61)) + bytes(range(0x7B, 0x7F))
-)  # fmt: skip
+    b"\t\n\x0b\x0c\r 0123456789"
+    + bytes(range(0x21, 0x30))
+    + bytes(range(0x3A, 0x41))
+    + bytes(range(0x5B, 0x61))
+    + bytes(range(0x7B, 0x7F))
+)
 
 
 def vocabulary(
@@ -153,8 +156,10 @@ def measure(arguments: argparse.Namespace) -> None:
     Path(arguments.output).parent.mkdir(parents=True, exist_ok=True)
     Path(arguments.output).write_text(json.dumps(report, indent=2) + "\n")
 
-    print(f"{all_tokens:,} tokens from {len(shards)} shards; "
-          f"{report['shared_occurrence_fraction']:.1%} shared anchors")  # fmt: skip
+    print(
+        f"{all_tokens:,} tokens from {len(shards)} shards; "
+        f"{report['shared_occurrence_fraction']:.1%} shared anchors"
+    )
     print("coverage  |S|     vocab(128)  rare occ.  length +  params(d=1024)")
 
     for point in points:

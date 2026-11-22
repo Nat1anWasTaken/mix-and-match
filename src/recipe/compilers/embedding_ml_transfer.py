@@ -146,8 +146,9 @@ def multi_train(context: Context, sources: dict[str, Source]) -> dict[str, Docs]
 
 
 def chinese(context: Context) -> Docs:
-    source = context.open("zh", f"{context.arguments.store_root}/{CHINESE}",
-                          columns=["fineweb2_chinese"])  # fmt: skip
+    source = context.open(
+        "zh", f"{context.arguments.store_root}/{CHINESE}", columns=["fineweb2_chinese"]
+    )
     kept = source.where(
         "fineweb2_chinese",
         lambda tags: (
@@ -185,8 +186,9 @@ def oracle_extra(
 
     check("zh", zh, half)
     check("fake_fra", fake, half)
-    return sample(context, "oracle/zh", zh, half), sample(context, "oracle/fake_fra",
-                                                          fake, half)  # fmt: skip
+    return sample(context, "oracle/zh", zh, half), sample(
+        context, "oracle/fake_fra", fake, half
+    )
 
 
 def compile(context: Context) -> None:

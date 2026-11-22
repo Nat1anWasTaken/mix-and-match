@@ -58,8 +58,12 @@ KIND = "vban_count"
 FIRST_SPECIAL = 151643
 
 SHARED, BAN, CONTINUATION, SPECIAL = 0, 1, 2, 3
-CATEGORY_NAMES = {SHARED: "shared", BAN: "ban", CONTINUATION: "continuation",
-                  SPECIAL: "special"}  # fmt: skip
+CATEGORY_NAMES = {
+    SHARED: "shared",
+    BAN: "ban",
+    CONTINUATION: "continuation",
+    SPECIAL: "special",
+}
 
 
 def bytes_to_unicode() -> dict[int, str]:
