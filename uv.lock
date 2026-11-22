@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.14"
 resolution-markers = [
     "sys_platform == 'win32'",
@@ -452,6 +452,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/f5/22/900cb125c76b7aaa4
 wheels = [
     { url = "https://files.pythonhosted.org/packages/de/15/545e2b6cf2e3be84bc1ed85613edd75b8aea69807a71c26f4ca6a9258e82/email_validator-2.3.0-py3-none-any.whl", hash = "sha256:80f13f623413e6b197ae73bb10bf4eb0908faf509ad8362c5edeb0be7fd450b4", size = 35604, upload-time = "2025-08-26T13:09:05.858Z" },
 ]
+
+[[package]]
+name = "fasttext-predict"
+version = "0.9.2.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/fc/0e/9defbb9385bcb1104cc1d686a14f7d9fafe5fe43f220cccb00f33d91bb47/fasttext_predict-0.9.2.4.tar.gz", hash = "sha256:18a6fb0d74c7df9280db1f96cb75d990bfd004fa9d669493ea3dd3d54f84dbc7", size = 16332, upload-time = "2024-11-23T17:24:44.801Z" }
 
 [[package]]
 name = "filelock"
@@ -1672,6 +1678,7 @@ dependencies = [
     { name = "boto3" },
     { name = "click" },
     { name = "datasets" },
+    { name = "fasttext-predict" },
     { name = "flock" },
     { name = "httpx" },
     { name = "huggingface-hub" },
@@ -1698,6 +1705,7 @@ requires-dist = [
     { name = "boto3" },
     { name = "click", specifier = ">=8.5.0" },
     { name = "datasets", specifier = ">=5.1.0" },
+    { name = "fasttext-predict", specifier = ">=0.9.2.4" },
     { name = "flock", git = "https://github.com/cerulean-works/flock?branch=main" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "huggingface-hub", specifier = ">=2.2.0" },
