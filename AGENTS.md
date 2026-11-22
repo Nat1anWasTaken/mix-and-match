@@ -63,8 +63,12 @@ depends on exist and its gate has passed.
 - Tokenizer and open donors are **Qwen3** (`151,936`). Track 1 extends the vocab with the
   Fake-French rows; track 2 keeps `151,936`. Qwen3 has no BOS: documents are separated by
   `<|endoftext|>` (`151,643`). Exclude rows `>= 151,643` from row means, BLI and masking.
-- Research runs must not log to the lab's W&B project (`lab7-data-curation`) or write
-  `oj_total_tokens`.
+- **W&B project: `embedding-ml-transfer`** (entity `cerulean-labs`, created 2026-11-23).
+  Every run of this experiment and its sub-branches logs there: training, data prep
+  (`prepare-`), scorers (`score-`) and debug runs. Pass `--wandb-project
+  embedding-ml-transfer`; the scripts default to the lab's project, so leaving it out logs
+  to the wrong place. Never log to the lab's project (`lab7-data-curation`), and never
+  write `oj_total_tokens`.
 - Short runs need their own `--global-batch-tokens`, `--warmup-steps` and `--total-tokens` (a
   multiple of the global batch); the defaults are tuned for 1B × 200B.
 - Take `Oracle_Emb` from `resume.pt`, not from the HF export, which folds the embedding

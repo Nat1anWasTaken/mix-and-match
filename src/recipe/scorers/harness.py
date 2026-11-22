@@ -26,7 +26,7 @@ setup returns one of:
   - ColumnScorer: reads columns of the source Lance dataset and turns them into one
     value per row with a vectorized transform, on the main process
 
-run() parses the common arguments (--store, --kind, --workers, --run-name, --no-wandb,
+run() parses the common arguments (--store, --kind, --workers, --run-name, --no-wandb, --wandb-project,
 --stage, --mirror, --remote) plus the scorer's own from add_arguments, then by --stage:
 
     fetch     mirrors the store's source fragments, then calls fetch
@@ -151,11 +151,13 @@ class Progress:
         )
 
 
-def open_logger(name: str | None, config: Mapping[str, object]) -> Logger:
+def open_logger(
+    name: str | None, config: Mapping[str, object], project: str = WANDB_PROJECT
+) -> Logger:
     if name is None:
         return ConsoleLogger()
 
-    return WandbLogger(WANDB_PROJECT, name, dict(config))
+    return WandbLogger(project, name, dict(config))
 
 
 def column_summary(values: numpy.ndarray) -> dict[str, float]:
@@ -238,7 +240,11 @@ def score(
 
     dataset = open_source_dataset(store, context.mirror)
     fragment_ids = source_fragment_ids(store)
-    logger = open_logger(run_name, {**vars(context.arguments), **info, "kind": kind})
+    logger = open_logger(
+        run_name,
+        {**vars(context.arguments), **info, "kind": kind},
+        context.arguments.wandb_project,
+    )
     progress = Progress(logger, len(fragment_ids))
 
     if isinstance(scorer, TextScorer):
@@ -294,6 +300,11 @@ def run(
         help="names the wandb run, e.g. score-<kind>-<store name>",
     )
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
+    parser.add_argument(
+        "--wandb-project",
+        default=WANDB_PROJECT,
+        help=f"wandb project to log to (default {WANDB_PROJECT}, the lab's)",
+    )
     add_stage_arguments(parser)
 
     if add_arguments is not None:

@@ -229,6 +229,11 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--run-name", required=True, help="names the wandb run")
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
+    parser.add_argument(
+        "--wandb-project",
+        default=WANDB_PROJECT,
+        help=f"wandb project to log to (default {WANDB_PROJECT}, the lab's)",
+    )
     add_stage_arguments(parser)
     parser.add_argument(
         "--mirror-margin",
@@ -522,7 +527,9 @@ def process(arguments: argparse.Namespace) -> None:
         logger: ConsoleLogger | WandbLogger = ConsoleLogger()
     else:
         logger = WandbLogger(
-            WANDB_PROJECT, arguments.run_name, {**vars(arguments), **metadata}
+            arguments.wandb_project,
+            arguments.run_name,
+            {**vars(arguments), **metadata},
         )
 
     fragment_ids = shuffled_fragment_ids(dataset, arguments.seed)
