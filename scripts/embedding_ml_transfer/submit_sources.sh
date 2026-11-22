@@ -17,8 +17,10 @@
 # the repo's usual F1 path instead: prepare.py --stage fetch here mirrors the fragments
 # it needs, then process, fineweb2_chinese and vban_count run as a chain.
 #
-# Stores are uploaded to s3://embedding-ml-transfer/sources/ by upload_sources.sh once
-# their chains have finished. Every job logs to logs/<job name>-<job id>.out.
+# Every prepare and score run logs to the wandb project embedding-ml-transfer (offline
+# on the compute node; sync_wandb.sh uploads the runs). Stores are uploaded to
+# s3://embedding-ml-transfer/sources/ by upload_sources.sh once their chains finish.
+# Every job logs to logs/<job name>-<job id>.out.
 
 set -euo pipefail
 
@@ -29,6 +31,10 @@ MIRRORS=/work1/$USER/mirrors/embedding-ml-transfer
 STORES=/work1/$USER/stores/embedding-ml-transfer
 GLOTLID=/work1/$USER/models/lid/glotlid/model_v3.bin
 TOKENIZER=Qwen/Qwen3-0.6B-Base
+WANDB_PROJECT=embedding-ml-transfer
+# Jobs run wandb offline (f1-cpu.sbatch), each in $F1_WANDB_ROOT/<job id>/; sync them
+# from the login node with sync_wandb.sh
+export F1_WANDB_ROOT=$PWD/logs/wandb/embedding-ml-transfer
 
 # source -> "picks record | token budget" (budgets sized for S2's 50B Multi-Train, plan
 # P0-1; English also covers Mono-Train)
@@ -42,7 +48,7 @@ declare -A TRAIN=(
 TESTS=(spa_Latn deu_Latn rus_Cyrl fra_Latn)
 CHINESE_BUDGET=9000000000
 
-mkdir -p logs "$MIRRORS" "$STORES"
+mkdir -p logs "$MIRRORS" "$STORES" "$F1_WANDB_ROOT"
 
 # sbatch scripts/f1-cpu.sbatch with a job name and an optional dependency; prints the id
 submit() {
@@ -75,11 +81,11 @@ submit_train() {
         scripts/embedding_ml_transfer/parquet_to_lance.py --picks "$picks" --output "$mirror")
     prepare=$(submit "prepare-$name" "$convert" prepare.py \
         --dataset "$mirror" --output "$store" --token-budget "$budget" \
-        --tokenizer "$TOKENIZER" --run-name "prepare-$name" --no-wandb)
+        --tokenizer "$TOKENIZER" --run-name "prepare-$name" --wandb-project "$WANDB_PROJECT")
     lid=$(submit "score-glotlid-$name" "$prepare" -m src.recipe.scorers.glotlid \
-        --store "$store" --model "$GLOTLID" --run-name "score-glotlid-$name" --no-wandb)
+        --store "$store" --model "$GLOTLID" --run-name "score-glotlid-$name" --wandb-project "$WANDB_PROJECT")
     vban=$(submit "score-vban_count-$name" "$lid" -m src.recipe.scorers.vban_count \
-        --store "$store" --run-name "score-vban_count-$name")
+        --store "$store" --run-name "score-vban_count-$name" --wandb-project "$WANDB_PROJECT")
     echo "$source: convert $convert -> prepare $prepare -> glotlid $lid -> vban $vban"
 }
 
@@ -98,7 +104,7 @@ submit_chinese() {
     local store=$STORES/$name mirror=$MIRRORS/fineweb-2-hani
     local arguments=(--dataset s3://flock-datasets/fineweb-2 --output "$store"
         --token-budget "$CHINESE_BUDGET" --tokenizer "$TOKENIZER"
-        --run-name "prepare-$name" --no-wandb --mirror "$mirror")
+        --run-name "prepare-$name" --wandb-project "$WANDB_PROJECT" --mirror "$mirror")
 
     export AWS_CA_BUNDLE=${AWS_CA_BUNDLE:-/etc/pki/tls/certs/ca-bundle.crt}
     eval "$(flock s3 credentials --ttl 24h)"
@@ -109,9 +115,9 @@ submit_chinese() {
     prepare=$(submit "prepare-$name" "" prepare.py "${arguments[@]}" --stage process)
     tags=$(submit "score-fineweb2_chinese-$name" "$prepare" \
         -m src.recipe.scorers.fineweb2_chinese --store "$store" --mirror "$mirror" \
-        --run-name "score-fineweb2_chinese-$name" --no-wandb --stage process)
+        --run-name "score-fineweb2_chinese-$name" --wandb-project "$WANDB_PROJECT" --stage process)
     vban=$(submit "score-vban_count-$name" "$tags" -m src.recipe.scorers.vban_count \
-        --store "$store" --run-name "score-vban_count-$name")
+        --store "$store" --run-name "score-vban_count-$name" --wandb-project "$WANDB_PROJECT")
     echo "cmn_Hani: prepare $prepare -> fineweb2_chinese $tags -> vban $vban"
 }
 

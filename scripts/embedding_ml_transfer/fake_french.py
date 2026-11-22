@@ -36,6 +36,9 @@ import numpy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from wandb_summary import add_arguments as add_wandb_arguments
+from wandb_summary import log_summary
+
 from src.recipe.metadata import read_shard_names
 from src.recipe.scorers.vban_count import FIRST_SPECIAL, token_bytes
 from src.tokenizer import ShardStore, document_token_ids, load_tokenizer
@@ -177,6 +180,19 @@ def measure(arguments: argparse.Namespace) -> None:
     print(
         f"{all_tokens:,} tokens from {len(shards)} shards; "
         f"{report['shared_occurrence_fraction']:.1%} shared anchors"
+    )
+    log_summary(
+        arguments,
+        {
+            "tokens": all_tokens,
+            "shared_occurrence_fraction": report["shared_occurrence_fraction"],
+            **{
+                f"coverage_{point['coverage']}/{key}": value
+                for point in points
+                for key, value in point.items()
+                if key != "coverage"
+            },
+        },
     )
     print("coverage  |S|     vocab(128)  rare occ.  length +  params(d=1024)")
 
@@ -373,7 +389,9 @@ def parse_arguments() -> argparse.Namespace:
     measure_parser.add_argument("--store", required=True)
     measure_parser.add_argument("--output", required=True)
     measure_parser.add_argument("--sample-shards", type=int, default=40)
+    add_wandb_arguments(measure_parser, run_name_required=False)
     build_parser = commands.add_parser("build")
+    add_wandb_arguments(build_parser, run_name_required=False)
     build_parser.add_argument("--store", required=True, help="the French store")
     build_parser.add_argument("--coverage", required=True, type=float)
     build_parser.add_argument("--output", required=True, help="the fake_fra store")

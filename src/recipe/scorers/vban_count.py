@@ -41,6 +41,7 @@ from pathlib import Path
 
 import numpy
 
+from ...loggers import WandbLogger
 from ...stages import add_stage_arguments, check_stage, upload_store
 from ...tokenizer import ShardStore, load_tokenizer
 from ..compile import compiler_record
@@ -52,6 +53,7 @@ from ..metadata import (
     read_shard_names,
     write_column,
 )
+from .harness import WANDB_PROJECT
 
 KIND = "vban_count"
 # The first special token of Qwen3; everything from here up is never banned
@@ -184,7 +186,12 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--run-name", help="score-vban_count-<store name>")
     parser.add_argument("--workers", type=int, default=1, help="unused; for sbatch")
-    parser.add_argument("--no-wandb", action="store_true", help="unused; console only")
+    parser.add_argument("--no-wandb", action="store_true", help="log to console only")
+    parser.add_argument(
+        "--wandb-project",
+        default=WANDB_PROJECT,
+        help=f"wandb project to log to (default {WANDB_PROJECT}, the lab's)",
+    )
     add_stage_arguments(parser)
     arguments = parser.parse_args()
 
@@ -263,11 +270,28 @@ def main() -> None:
         f"{META}/{KIND}/record.json", compiler_record(main, path, arguments)
     )
     store.write_text(f"{META}/{KIND}/scorer.py", path.read_text())
+    summary = {
+        "score/documents": total_documents,
+        "score/documents_with_ban": flagged,
+        "score/nonzero_fraction": flagged / max(total_documents, 1),
+        "score/ban_tokens": total_banned,
+        "score/seconds": time.monotonic() - start,
+    }
     print(
         f"meta/{KIND}: documents={total_documents} with_ban={flagged} "
-        f"ban_tokens={total_banned} seconds={time.monotonic() - start:.1f}",
+        f"ban_tokens={total_banned} seconds={summary['score/seconds']:.1f}",
         flush=True,
     )
+
+    if not arguments.no_wandb and arguments.run_name is not None:
+        logger = WandbLogger(
+            arguments.wandb_project, arguments.run_name, {**vars(arguments), **info}
+        )
+
+        for key, value in summary.items():
+            logger.run.summary[key] = value
+
+        logger.finish()
 
 
 if __name__ == "__main__":

@@ -42,6 +42,9 @@ import numpy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from wandb_summary import add_arguments as add_wandb_arguments
+from wandb_summary import log_summary
+
 from src.recipe.recipe import Cursor, Recipe, load_recipe
 from src.recipe.scorers.vban_count import CATEGORY_NAMES, byte_categories
 from src.tokenizer import ShardStore, load_tokenizer
@@ -225,6 +228,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=multiprocessing.cpu_count())
+    add_wandb_arguments(parser, run_name_required=False)
     return parser.parse_args()
 
 
@@ -327,6 +331,23 @@ def main() -> None:
     )
     report["gate_pass"] = gate
     (output / "audit.json").write_text(json.dumps(report, indent=2) + "\n")
+    summary: dict[str, object] = {"gate_pass": gate}
+
+    for name, entry in report["recipes"].items():
+        for cursor, total in entry["cursors"].items():
+            for key in ("tokens", "ban", "continuation", "shifted", "max_id"):
+                summary[f"{name}/{cursor}/{key}"] = total[key]
+
+        spot = entry["spot_check"]
+        summary[f"{name}/spot_check/rate"] = spot["rate"]
+        summary[f"{name}/spot_check/ci95_high"] = spot["ci95"][1]
+        summary[f"{name}/spot_check/sampled"] = spot["sampled"]
+
+    for name, counts in report["eval_text"].items():
+        for key, value in counts.items():
+            summary[f"eval_text/{name}/{key}"] = value
+
+    log_summary(arguments, summary)
 
     with (output / "flagged.jsonl").open("w") as stream:
         for record in flagged_all:
