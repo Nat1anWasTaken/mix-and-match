@@ -54,6 +54,12 @@ depends on exist and its gate has passed.
 
 ### Things that apply across this branch
 
+- **S3 bucket: `s3://embedding-ml-transfer`** (created 2026-11-23). Every artifact of this
+  experiment and its sub-branches goes there: shard stores under `sources/`, recipes under
+  `recipes/`, eval sets under `eval/`, checkpoints and extracted embeddings. Don't write to
+  `s3://mix-and-match` or `s3://scaling-llama-3-2`; those hold the lab's data. Recipes store
+  absolute store URIs, so compile them with `s3://embedding-ml-transfer/...` store URIs, and
+  only after every store they use has been uploaded.
 - Tokenizer and open donors are **Qwen3** (`151,936`). Track 1 extends the vocab with the
   Fake-French rows; track 2 keeps `151,936`. Qwen3 has no BOS: documents are separated by
   `<|endoftext|>` (`151,643`). Exclude rows `>= 151,643` from row means, BLI and masking.
