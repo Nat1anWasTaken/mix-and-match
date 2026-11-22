@@ -20,10 +20,10 @@ BUCKET=s3://embedding-ml-transfer
 
 # store -> the meta/ kinds it must have
 declare -A KINDS=(
-    [fineweb-qwen3]="glotlid vban_count"
-    [fineweb-2-spa_Latn-qwen3]="glotlid vban_count"
-    [fineweb-2-deu_Latn-qwen3]="glotlid vban_count"
-    [fineweb-2-rus_Cyrl-qwen3]="glotlid vban_count"
+    [fineweb-qwen3]="glotlid glotlid_v2 vban_count"
+    [fineweb-2-spa_Latn-qwen3]="glotlid glotlid_v2 vban_count"
+    [fineweb-2-deu_Latn-qwen3]="glotlid glotlid_v2 vban_count"
+    [fineweb-2-rus_Cyrl-qwen3]="glotlid glotlid_v2 vban_count"
     [fineweb-2-fra_Latn-qwen3]="glotlid vban_count"
     [fineweb-2-cmn_Hani-qwen3]="fineweb2_chinese vban_count"
     [fake-fra-qwen3]=""

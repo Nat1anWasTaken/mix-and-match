@@ -26,8 +26,10 @@ oracle_train and mono_train reproduce its selection exactly, given the same stor
 --multi-tokens, --margin and --seed.
 
 Filters, on L_train sources (en, es, de, ru), from the scorers' meta/ columns:
-  - meta/glotlid: no line with P(French) > 0.5 or P(Chinese) > 0.5, and the whole
-    document under 0.01 for both (--long-lines-only uses the >= 50 character lines)
+  - meta/<--lid-kind> (glotlid.py): no line with P(French) or P(Chinese) above
+    --line-threshold (0.5), counting the lines --line-length picks: all of them, those
+    of >= 20 characters (mid, glotlid_v2 only) or >= 50 (long); and the whole document
+    under 0.01 for both. --long-lines-only is --line-length long
   - meta/vban_count == 0: no Chinese token at all
 Chinese: cmn_Hani, train split, simplified only (meta/fineweb2_chinese). Fake-French
 is built from French train documents only, so it needs no filter.
@@ -74,9 +76,19 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="--total-tokens of the Oracle-Train the adaptation corpora avoid",
     )
     parser.add_argument(
+        "--lid-kind", default="glotlid", help="meta/ kind from the glotlid scorer"
+    )
+    parser.add_argument(
+        "--line-length",
+        choices=["all", "mid", "long"],
+        default="all",
+        help="which lines count: all, >= 20 characters (mid) or >= 50 (long)",
+    )
+    parser.add_argument("--line-threshold", type=float, default=LINE_THRESHOLD)
+    parser.add_argument(
         "--long-lines-only",
         action="store_true",
-        help="judge paragraphs by the lines of >= 50 characters only",
+        help="the same as --line-length long",
     )
 
 
@@ -90,18 +102,20 @@ def sample(context: Context, component: str, documents: Docs, tokens: int) -> Do
     return documents.sample(tokens)
 
 
-def clean(source: Source, long_lines_only: bool) -> Docs:
-    suffix = "_line_long" if long_lines_only else "_line"
+def clean(source: Source, arguments: argparse.Namespace) -> Docs:
+    length = "long" if arguments.long_lines_only else arguments.line_length
+    suffix = {"all": "_line", "mid": "_line_mid", "long": "_line_long"}[length]
+    threshold = arguments.line_threshold
 
     def no_ban_language(scores: numpy.ndarray) -> numpy.ndarray:
         return (
-            (scores["fra" + suffix] <= LINE_THRESHOLD)
-            & (scores["zh" + suffix] <= LINE_THRESHOLD)
+            (scores["fra" + suffix] <= threshold)
+            & (scores["zh" + suffix] <= threshold)
             & (scores["fra_doc"] <= DOCUMENT_THRESHOLD)
             & (scores["zh_doc"] <= DOCUMENT_THRESHOLD)
         )
 
-    lid = source.where("glotlid", no_ban_language)
+    lid = source.where(arguments.lid_kind, no_ban_language)
     tokens = source.where("vban_count", lambda counts: counts == 0)
     kept = lid & tokens
     print(
@@ -130,7 +144,7 @@ def multi_train(context: Context, sources: dict[str, Source]) -> dict[str, Docs]
     target = context.arguments.multi_tokens * (1 + context.margin)
     budgets = context.split(MULTI_WEIGHTS, target)
     kept = {
-        language: clean(sources[language], context.arguments.long_lines_only)
+        language: clean(sources[language], context.arguments)
         for language in MULTI_WEIGHTS
     }
 
@@ -199,7 +213,7 @@ def compile(context: Context) -> None:
     if split in ("multi_train", "mono_train", "oracle_train"):
         sources = context.open_many(
             {language: f"{root}/{store}" for language, store in L_TRAIN.items()},
-            columns=["glotlid", "vban_count"],
+            columns=[context.arguments.lid_kind, "vban_count"],
         )
         multi = multi_train(context, sources)
 
@@ -208,7 +222,7 @@ def compile(context: Context) -> None:
             context.cursor(language, multi[language])
 
     elif split == "mono_train":
-        english = clean(sources["en"], context.arguments.long_lines_only)
+        english = clean(sources["en"], context.arguments)
         more = context.budget() - multi["en"].tokens
         rest = english - multi["en"]
         check("en (beyond Multi-Train)", rest, more)
