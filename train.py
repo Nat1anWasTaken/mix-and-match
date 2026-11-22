@@ -25,6 +25,8 @@ from src.trainer import Trainer, TrainingConfig
 
 TOKENIZER_NAME = "meta-llama/Llama-3.2-1B"
 WANDB_PROJECT = "lab7-data-curation"
+# Llama 3's 128,256. Other tokenizers pass --vocab-size: embedding-ml-transfer's track 1
+# is Qwen3's 151,936 plus the Fake-French rows (181,632), track 2 Qwen3's own 151,936
 VOCAB_SIZE = 128256
 # Lab 7: repeats of up to this fraction of the training data don't count toward the score
 FREE_REPEAT_FRACTION = 0.1
@@ -71,6 +73,11 @@ MODEL_SIZES = {
     "500M": ModelSize(11, 1536, 4672, 24, 6),
     "750M": ModelSize(13, 1792, 5888, 28, 7),
     "1B": ModelSize(15, 1792, 8000, 28, 7),
+    # embedding-ml-transfer: d=1024 (Qwen3-0.6B's width), head_dim 64, only the depth
+    # changes, so CompleteP transfers from t1-l12 with m_d = 1 and m_L = L / 12
+    "t1-l12": ModelSize(12, 1024, 3072, 16, 4),
+    "t1-l24": ModelSize(24, 1024, 3072, 16, 4),
+    "t1-l40": ModelSize(40, 1024, 3072, 16, 4),
 }
 
 
@@ -185,6 +192,14 @@ def parse_arguments() -> argparse.Namespace:
         help="model init; the data order comes from the recipe's own seed",
     )
     parser.add_argument("--tokenizer", default=TOKENIZER_NAME)
+    parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=VOCAB_SIZE,
+        help=f"embedding rows (default {VOCAB_SIZE:,}, Llama 3's); at least the "
+        "tokenizer's length, and above it when the recipe holds ids the tokenizer "
+        "doesn't (Fake-French's shifted ids)",
+    )
     parser.add_argument("--device", help="default: cuda, else mps, else cpu")
     parser.add_argument(
         "--compile",
@@ -313,6 +328,7 @@ def build_model_config(
     seq_len: int,
     bos_token_id: int,
     eos_token_id: int,
+    vocab_size: int = VOCAB_SIZE,
 ) -> ScalingLlamaConfig:
     base_size = base_size or size
     return ScalingLlamaConfig(
@@ -320,7 +336,7 @@ def build_model_config(
         base_intermediate_size=base_size.intermediate_size,
         base_num_hidden_layers=base_size.num_layers,
         embedding_multiplier=embedding_multiplier,
-        vocab_size=VOCAB_SIZE,
+        vocab_size=vocab_size,
         hidden_size=size.hidden_size,
         intermediate_size=size.intermediate_size,
         num_hidden_layers=size.num_layers,
@@ -377,6 +393,13 @@ def main() -> None:
     tokenizer = load_tokenizer(arguments.tokenizer)
     # Without a BOS (Qwen3), documents start with the EOS, as prepare.py writes them
     bos_token_id, eos_token_id = document_token_ids(tokenizer)
+    # A row per token id: fewer rows than the tokenizer's ids is an out-of-range lookup,
+    # which on CUDA is a device-side assert with no useful message
+    if arguments.vocab_size < len(tokenizer):
+        raise ValueError(
+            f"--vocab-size {arguments.vocab_size:,} is smaller than {arguments.tokenizer}'s "
+            f"{len(tokenizer):,} tokens"
+        )
 
     model_config = build_model_config(
         MODEL_SIZES[arguments.model_size],
@@ -385,6 +408,7 @@ def main() -> None:
         arguments.seq_len,
         bos_token_id,
         eos_token_id,
+        arguments.vocab_size,
     )
     model = LlamaCausalLM(model_config).to(device)
 
@@ -582,9 +606,11 @@ def main() -> None:
         logger.run.summary["total_tokens"] = total_tokens
         if trainer.stop_reason is not None:
             logger.run.summary["stop_reason"] = trainer.stop_reason
-        logger.run.summary["oj_total_tokens"] = oj_counted_tokens(
-            total_tokens, repeated_share
-        )
+        # The lab's OJ scores the lab project's oj_total_tokens: only its runs write it
+        if arguments.wandb_project == WANDB_PROJECT:
+            logger.run.summary["oj_total_tokens"] = oj_counted_tokens(
+                total_tokens, repeated_share
+            )
         logger.finish()
 
     if torch.distributed.is_initialized():
