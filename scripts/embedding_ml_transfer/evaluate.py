@@ -419,8 +419,8 @@ def main() -> None:
     }
     report["seconds"] = time.time() - started
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
-    arguments.output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
-    numpy.savez(arguments.output.with_suffix(".npz"), **arrays)
+    Path(f"{arguments.output}.json").write_text(json.dumps(report, indent=2) + "\n")
+    numpy.savez(Path(f"{arguments.output}.npz"), **arrays)
     print(f"wrote {arguments.output}.json/.npz in {report['seconds']:.0f} s", flush=True)
 
 
