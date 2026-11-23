@@ -38,6 +38,13 @@ trained rows that are also kept, so no random row is left in the Floor's softmax
 the rows outside 'keep' are -inf. A language (or Delta pair) with a target outside 'keep'
 cannot be scored that way and is skipped; in practice this scores L_train only.
 
+--shuffle-seed N is the shuffled control (plan Phase 1, A1): the Chinese V_ban rows are
+permuted among themselves and the Fake-French rows among themselves. Each language keeps
+its rows' distribution but loses which token has which row, so the gap to the unshuffled
+checkpoint is what the token-level alignment is worth. The self-Floor is --floor on the
+same checkpoint. Real French has no rows of its own (it shares L_train's), so neither
+control applies to it.
+
 The checkpoint's HF directory is used: it is a plain Llama computing the same function
 as training (multipliers folded in), which is all scoring needs. Runs on one GPU.
 """
@@ -259,6 +266,39 @@ def reset_floor_rows(
     return {"floor_rows_reset": int(reset.sum()), "floor_mean_over": int(trained.sum())}
 
 
+def shuffle_rows(
+    model: LlamaForCausalLM, categories: numpy.ndarray, fake_rows: int, seed: int
+) -> dict:
+    """
+    The shuffled control: permute the Chinese V_ban rows among themselves and the
+    Fake-French rows among themselves, on the tied embedding. Each group keeps its exact
+    set of rows (norms, mean offset, where it sits), only which token gets which row is
+    lost. Every other row is untouched, so a softmax over the whole vocab sees the same
+    set of logits and the L_train BPB does not move.
+    """
+    embedding = model.model.embed_tokens.weight
+    assert model.lm_head.weight is embedding, "the export lost its tie"
+    vocab = embedding.shape[0]
+    ids = numpy.arange(vocab)
+    groups = {
+        "zh": ids[(ids < BASE_VOCAB) & (categories[:vocab] == BAN)],
+        "fake": numpy.arange(BASE_VOCAB, BASE_VOCAB + fake_rows),
+    }
+    generator = numpy.random.default_rng(seed)
+    report = {"shuffle_seed": seed}
+    with torch.no_grad():
+        for name, rows in groups.items():
+            if rows.size == 0:
+                continue
+            order = generator.permutation(rows)
+            source = torch.from_numpy(order).to(embedding.device)
+            target = torch.from_numpy(rows).to(embedding.device)
+            embedding[target] = embedding[source].clone()
+            report[f"shuffle_rows_{name}"] = int(rows.size)
+            report[f"shuffle_fixed_{name}"] = int((order == rows).sum())
+    return report
+
+
 def flores_items(
     encoder: Encoder, flores: Path, max_length: int
 ) -> dict[str, tuple[list[list[Item]], numpy.ndarray]]:
@@ -381,6 +421,12 @@ def main() -> None:
         type=Path,
         help="score with the masked softmax of this npz's 'keep' (skips what it cannot score)",
     )
+    parser.add_argument(
+        "--shuffle-seed",
+        type=int,
+        help="the shuffled control: permute the Chinese V_ban rows among themselves and the "
+        "Fake-French rows among themselves with this seed before scoring",
+    )
     parser.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B-Base")
     parser.add_argument("--fineweb2-documents", type=int, default=1000)
     parser.add_argument("--max-length", type=int, default=4096)
@@ -413,6 +459,8 @@ def main() -> None:
     }
     if arguments.floor_keep is not None and not arguments.floor:
         parser.error("--floor-keep needs --floor")
+    if arguments.shuffle_seed is not None and arguments.floor:
+        parser.error("--shuffle-seed and --floor are two different controls")
     if arguments.floor:
         floor_keep = (
             numpy.load(arguments.floor_keep)["keep"] if arguments.floor_keep is not None else None
@@ -441,6 +489,10 @@ def main() -> None:
         else None
     )
     has_fake = fake is not None and vocab >= BASE_VOCAB + fake.members.size
+    if arguments.shuffle_seed is not None:
+        report |= shuffle_rows(
+            model, categories, fake.members.size if has_fake else 0, arguments.shuffle_seed
+        )
     if not has_fake:
         print(f"vocab {vocab}: no Fake-French table or rows, skipping fake", flush=True)
     encoder = Encoder(arguments.tokenizer, fake)
