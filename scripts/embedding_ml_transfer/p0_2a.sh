@@ -12,7 +12,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 mode=$1 commit=$2
-RECIPE=s3://embedding-ml-transfer/recipes/multi-train-20b
+RECIPE=s3://embedding-ml-transfer/recipes/multi-train-20b-v2
 CACHE=/work/u9216411/acd115198/recipe-cache
 BATCH=1048576
 
