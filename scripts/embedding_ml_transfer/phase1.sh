@@ -26,8 +26,41 @@ embedding=(--donor-embedding "$donor" --freeze-embeddings)
 variant=""
 extra=()
 
+trainable=(--donor-embedding "$donor" --adamw-weight-decay 0)
 case $experiment in
 a1)
+    ;;
+a1-seed2)
+    # Plan §6: the key comparisons (A1 vs Floor, A1 vs A4c) get a second seed. The seed
+    # changes the body's init; the data order is the recipe's and does not move
+    experiment=a1 variant=-seed2 seed=43
+    ;;
+a2)
+    # Mono-Train (English only, 20.20B); its own keep set, which also drops es/de/ru-only ids
+    recipe=mono-train-20b-v2 keep=$RUNS/softmax-keep/mono-train-20b-v2.npz
+    ;;
+a3)
+    # Track 2: Qwen3-0.6B-Base's embedding at HP_frozen_qwen, vocab 151,936 (no
+    # Fake-French rows); Multi-Train has no id >= 151,936, so A1's keep set applies as is
+    donor=$RUNS/donors/qwen3-0.6b-base-emb.pt vocab=151936 ein=1 eout=1
+    embedding=(--donor-embedding "$donor" --freeze-embeddings)
+    ;;
+a4c)
+    # Oracle_Emb as init, trainable, embedding wd 0 (--adamw-weight-decay only reaches the
+    # tied embedding; RMSNorm gains are never decayed), masked softmax: the rows outside the
+    # keep set (all L_ban rows among them) get no gradient and no decay, so they stay
+    # Oracle_Emb bit for bit and only the L_train rows drift. A1's multipliers, so A4c vs A1
+    # differs only in the L_train rows being trainable
+    embedding=("${trainable[@]}")
+    ;;
+a4a)
+    # As A4c with the full softmax: the L_ban rows are trainable too and, as negatives,
+    # pushed every step. A4a vs A4c is one switch, the mask
+    embedding=("${trainable[@]}") keep=""
+    ;;
+a4b)
+    # As A4a with the default embedding wd 0.1
+    embedding=(--donor-embedding "$donor") keep=""
     ;;
 a1-mask150)
     # The masked arm of the 150M ablation; the full-softmax arm is P0-2b's
@@ -48,5 +81,5 @@ SBATCH_EXTRA="${node:+--nodelist=25a-hgpn$node}" scripts/embedding_ml_transfer/l
     --decay-fraction 0.2 --eval fineweb_en --seed $seed --model-size $model \
     --total-tokens $((steps * BATCH)) --warmup-steps $warmup --muon-lr $lr --adamw-lr $alr \
     "${embedding[@]}" --embedding-multiplier $ein --output-multiplier $eout \
-    --softmax-keep "$keep" "${extra[@]}"
+    ${keep:+--softmax-keep "$keep"} "${extra[@]}"
 echo "$name"

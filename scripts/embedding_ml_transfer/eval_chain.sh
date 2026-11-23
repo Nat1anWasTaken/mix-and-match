@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 job=$1 name=$2 step=$3 out=$4 controls=${5:-}
 RUNS=/work/u9216411/acd115198/embedding-ml-transfer-runs
-KEEP=$RUNS/softmax-keep/multi-train-20b-v2.npz
+KEEP=${KEEP:-$RUNS/softmax-keep/multi-train-20b-v2.npz}  # the run's training keep set (A2: mono-train)
 mkdir -p "$out"
 common=(--checkpoint "$RUNS/checkpoints/$name/step-$step" --fake-french "$RUNS/p0-1/fake-french"
     --language-sets "$RUNS/language-sets" --flores "$RUNS/eval-data/flores"
