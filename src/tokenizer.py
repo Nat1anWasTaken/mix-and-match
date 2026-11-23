@@ -241,10 +241,28 @@ def load_tokenizer(name: str) -> PreTrainedTokenizerFast:
             f"expected a PreTrainedTokenizerFast tokenizer, got {type(tokenizer).__name__}"
         )
 
-    if tokenizer.bos_token_id is None or tokenizer.eos_token_id is None:
-        raise ValueError("tokenizer must have bos_token_id and eos_token_id")
+    if tokenizer.eos_token_id is None:
+        raise ValueError("tokenizer must have an eos_token_id")
 
     return tokenizer
+
+
+def document_token_ids(tokenizer: PreTrainedTokenizerFast) -> tuple[int, int]:
+    """
+    The (start, end) tokens every document is wrapped in: [BOS, text, EOS].
+
+    Qwen3 has no BOS and separates documents with <|endoftext|>, its EOS (151643), so a
+    tokenizer without a BOS starts documents with its EOS: [EOS, text, EOS]. Either way
+    the start token sits at position 0 of every document, where the trainer masks the
+    label, so packing and the loss treat both layouts the same
+    """
+    eos_token_id = tokenizer.eos_token_id
+
+    if eos_token_id is None:
+        raise ValueError("tokenizer must have an eos_token_id")
+
+    bos_token_id = tokenizer.bos_token_id
+    return (eos_token_id if bos_token_id is None else bos_token_id), eos_token_id
 
 
 def open_dataset(uri: str, version: int | None = None) -> LanceDataset:
@@ -457,11 +475,10 @@ class FragmentTokenizer:
             texts, add_special_tokens=False, return_attention_mask=False
         )
 
-        bos_token_id = self.tokenizer.bos_token_id
-        eos_token_id = self.tokenizer.eos_token_id
+        start_token_id, end_token_id = document_token_ids(self.tokenizer)
 
         return [
-            numpy.array([bos_token_id, *token_ids, eos_token_id], dtype=numpy.int32)
+            numpy.array([start_token_id, *token_ids, end_token_id], dtype=numpy.int32)
             for token_ids in encoded["input_ids"]
         ]
 

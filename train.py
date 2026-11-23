@@ -20,7 +20,7 @@ from src.optimizer import build_muon_adamw, build_warmup_stable_decay
 from src.recipe.cache import localize_recipe
 from src.recipe.recipe import load_recipe
 from src.token_stream import RecipeTokenStream
-from src.tokenizer import load_tokenizer
+from src.tokenizer import document_token_ids, load_tokenizer
 from src.trainer import Trainer, TrainingConfig
 
 TOKENIZER_NAME = "meta-llama/Llama-3.2-1B"
@@ -370,10 +370,8 @@ def main() -> None:
     )
 
     tokenizer = load_tokenizer(arguments.tokenizer)
-    bos_token_id = tokenizer.bos_token_id
-    eos_token_id = tokenizer.eos_token_id
-    if bos_token_id is None or eos_token_id is None:
-        raise ValueError("tokenizer must have bos_token_id and eos_token_id")
+    # Without a BOS (Qwen3), documents start with the EOS, as prepare.py writes them
+    bos_token_id, eos_token_id = document_token_ids(tokenizer)
 
     model_config = build_model_config(
         MODEL_SIZES[arguments.model_size],

@@ -92,6 +92,9 @@ SHARD_FORMAT = (
     "data/<shard>/: [BOS, text, EOS] int32 tokens.npy + int64 offsets.npy + "
     "int64 row_ids.npy (Lance _rowaddr), globally shuffled into buckets"
 )
+# The same layout for a tokenizer without a BOS (Qwen3): documents start with the EOS.
+# A separate string, so stores made with a BOS keep their metadata.json and can resume
+SHARD_FORMAT_NO_BOS = SHARD_FORMAT.replace("[BOS, text, EOS]", "[EOS, text, EOS]")
 # 3: phase 1 in chunks, bucket draws per row of the fragment (2 drew them per kept
 # document), so a layout 2 fragment store can't be continued
 LAYOUT_VERSION = 3
@@ -304,7 +307,7 @@ def estimate_tokens(
     rows: int, texts: list[str], tokens_per_character: float
 ) -> tuple[int, float]:
     """
-    A fragment's tokens as process stores them ([BOS, text, EOS] per kept row), from its
+    A fragment's tokens as process stores them ([start, text, EOS] per kept row), from its
     row count and a sample of its rows, and the variance of that estimate
     """
     characters = numpy.array([len(text) for text in texts], dtype=numpy.float64)
@@ -496,6 +499,9 @@ def process(arguments: argparse.Namespace) -> None:
         dataset = open_dataset(dataset_uri)
 
     num_buckets = math.ceil(arguments.token_budget / arguments.shard_tokens)
+    # Download into the HF cache once here, so workers don't all race to download it,
+    # and see which document layout it gets
+    has_bos = load_tokenizer(arguments.tokenizer).bos_token_id is not None
 
     # The fragments' bucket assignment depends on seed and num_buckets, so both must
     # match for a rerun to reuse them
@@ -503,7 +509,7 @@ def process(arguments: argparse.Namespace) -> None:
         "tokenizer": arguments.tokenizer,
         "dataset": arguments.dataset,
         "dataset_version": dataset.version,
-        "format": SHARD_FORMAT,
+        "format": SHARD_FORMAT if has_bos else SHARD_FORMAT_NO_BOS,
         "layout": LAYOUT_VERSION,
         "seed": arguments.seed,
         "num_buckets": num_buckets,
@@ -518,9 +524,6 @@ def process(arguments: argparse.Namespace) -> None:
         logger = WandbLogger(
             WANDB_PROJECT, arguments.run_name, {**vars(arguments), **metadata}
         )
-
-    # Download into the HF cache once here, so workers don't all race to download it,
-    load_tokenizer(arguments.tokenizer)
 
     fragment_ids = shuffled_fragment_ids(dataset, arguments.seed)
     # The mirror lists every fragment but holds the data of a prefix of this order only
