@@ -38,6 +38,11 @@ trained rows that are also kept, so no random row is left in the Floor's softmax
 the rows outside 'keep' are -inf. A language (or Delta pair) with a target outside 'keep'
 cannot be scored that way and is skipped; in practice this scores L_train only.
 
+--center-rows <counts npz> is A5's mean-centering (each L_ban language's own rows moved
+by mu(L_train) - mu(L)). With --language-sets, every Delta whose target is zh or fake
+also reports delta_masked/<pair>, the gain under A5's vocabulary masking (softmax over
+V_L only); the masked BPB of an L_ban set is already split/<set>/<lang>/within + outside.
+
 --shuffle-seed N is the shuffled control (plan Phase 1, A1): the Chinese V_ban rows are
 permuted among themselves and the Fake-French rows among themselves. Each language keeps
 its rows' distribution but loses which token has which row, so the gap to the unshuffled
@@ -314,6 +319,52 @@ def shuffle_rows(
     return report
 
 
+def center_rows(
+    model: LlamaForCausalLM,
+    categories: numpy.ndarray,
+    fake_rows: int,
+    language_counts: dict[str, numpy.ndarray],
+    train_counts: numpy.ndarray,
+) -> dict:
+    """
+    A5's mean-centering: move each L_ban language's own rows (Chinese V_ban; the
+    Fake-French rows) by mu(L_train) - mu(L), on every token matrix (row_weights). Both
+    means are token-frequency weighted: mu(L) over the language's own rows with the counts
+    of its training text (the language-set npz, Oracle-Train's zh / fake_fra cursors, not
+    the eval sets), mu(L_train) over the L_train rows (below 151,643, not V_ban) with the
+    run's training counts. Shared tokens (digits, punctuation, Latin) are not moved, so a
+    language only loses its offset. Real French has no rows of its own and is untouched
+    """
+    weights = row_weights(model)
+    vocab = weights[0].shape[0]
+    ids = numpy.arange(vocab)
+    train = (ids < FIRST_SPECIAL) & (categories[:vocab] != BAN) & (train_counts[:vocab] > 0)
+    own = {
+        "zh": (ids < BASE_VOCAB) & (categories[:vocab] == BAN),
+        "fake": (ids >= BASE_VOCAB) & (ids < BASE_VOCAB + fake_rows),
+    }
+    report = {}
+    with torch.no_grad():
+        for embedding in weights:
+            def mean(rows: numpy.ndarray, counts: numpy.ndarray) -> torch.Tensor:
+                w = torch.from_numpy(counts[:vocab][rows].astype(numpy.float64)).to(embedding.device)
+                picked = embedding[torch.from_numpy(rows).to(embedding.device)].double()
+                return (w[:, None] * picked).sum(0) / w.sum()
+
+            mu_train = mean(train, train_counts)
+            for name, rows in own.items():
+                counts = language_counts.get(name)
+                rows = rows & (counts[:vocab] > 0) if counts is not None else rows & False
+                if not rows.any():
+                    continue
+                shift = mu_train - mean(rows, counts)
+                index = torch.from_numpy(own[name]).to(embedding.device)
+                embedding[index] += shift.to(embedding.dtype)
+                report[f"center_rows_{name}"] = int(own[name].sum())
+                report[f"center_shift_norm_{name}"] = float(shift.norm())
+    return report
+
+
 def flores_items(
     encoder: Encoder, flores: Path, max_length: int
 ) -> dict[str, tuple[list[list[Item]], numpy.ndarray]]:
@@ -442,6 +493,13 @@ def main() -> None:
         help="the shuffled control: permute the Chinese V_ban rows among themselves and the "
         "Fake-French rows among themselves with this seed before scoring",
     )
+    parser.add_argument(
+        "--center-rows",
+        type=Path,
+        help="A5 mean-centering: the run's training counts npz (its --softmax-keep file, "
+        "'counts'); moves each L_ban language's own rows by mu(L_train) - mu(L), "
+        "frequency weighted (needs --language-sets for the L_ban counts)",
+    )
     parser.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B-Base")
     parser.add_argument("--fineweb2-documents", type=int, default=1000)
     parser.add_argument("--max-length", type=int, default=4096)
@@ -521,6 +579,18 @@ def main() -> None:
             mask[torch.from_numpy(keep[keep < vocab])] = True
             language_sets[name] = mask.to(device)
             report[f"language_set_{name}"] = int(mask.sum())
+    if arguments.center_rows is not None:
+        if arguments.language_sets is None or arguments.floor or arguments.shuffle_seed is not None:
+            parser.error("--center-rows needs --language-sets and no other control")
+        counts = {
+            name: numpy.load(arguments.language_sets / f"{name}.npz")["counts"]
+            for name in ("zh", "fake")
+        }
+        report |= center_rows(
+            model, categories, fake.members.size if has_fake else 0, counts,
+            numpy.load(arguments.center_rows)["counts"],
+        )
+        report["center_rows"] = str(arguments.center_rows)
 
     for set_name, sets in [
         ("flores", flores_items(encoder, arguments.flores, arguments.max_length)),
@@ -583,8 +653,17 @@ def main() -> None:
             if not (scorable(real) and scorable(unrelated)):
                 print(f"delta/{source}-{target}: a target outside --softmax-keep, skipped", flush=True)
                 continue
-            nll_real = score(model, real, arguments.batch_tokens, device, allowed=allowed)
-            nll_unrelated = score(model, unrelated, arguments.batch_tokens, device, allowed=allowed)
+            # Targets in an L_ban language: one pass also gives the vocabulary-masked score
+            # (A5 (b)): softmax over V_L only, i.e. within + outside per target
+            subset = language_sets.get(target) if target in ("zh", "fake") else None
+            nll_real = score(model, real, arguments.batch_tokens, device, subset, allowed)
+            nll_unrelated = score(model, unrelated, arguments.batch_tokens, device, subset, allowed)
+            masked = None
+            if subset is not None:
+                masked = (
+                    nll_real[:, 1] + nll_real[:, 3], nll_unrelated[:, 1] + nll_unrelated[:, 3]
+                )
+                nll_real, nll_unrelated = nll_real[:, 0], nll_unrelated[:, 0]
             key = f"delta/{source}-{target}"
             arrays[f"{key}/nll_real"] = nll_real
             arrays[f"{key}/nll_unrelated"] = nll_unrelated
@@ -602,6 +681,19 @@ def main() -> None:
                 "n": int(utf8.size),
             }
             print(f"{key}: {value:.4f} [{low:.4f}, {high:.4f}]", flush=True)
+            if masked is not None:
+                masked_key = f"delta_masked/{source}-{target}"
+                arrays[f"{masked_key}/nll_real"], arrays[f"{masked_key}/nll_unrelated"] = masked
+                gain = (masked[1] - masked[0]) / LN2
+                samples = gain[picks].sum(1) / utf8[picks].sum(1)
+                low, high = numpy.percentile(samples, [2.5, 97.5])
+                report["metrics"][masked_key] = {
+                    "value": float(gain.sum() / utf8.sum()),
+                    "ci95": [float(low), float(high)],
+                    "bpb_real": float(masked[0].sum() / (LN2 * utf8.sum())),
+                    "bpb_unrelated": float(masked[1].sum() / (LN2 * utf8.sum())),
+                }
+                print(f"{masked_key}: {report['metrics'][masked_key]['value']:.4f} [{low:.4f}, {high:.4f}]", flush=True)
 
     train_keys = [f"bpb/flores/{short}" for short in ("en", "es", "de", "ru")]
     if all(k in report["metrics"] for k in train_keys):
