@@ -16,6 +16,7 @@ MUP_CONFIG_KEYS = (
     "base_num_hidden_layers",
     "embedding_multiplier",
     "output_multiplier",
+    "output_delta",
 )
 
 
@@ -27,6 +28,7 @@ class ScalingLlamaConfig(LlamaConfig):
         base_num_hidden_layers: int | None = None,
         embedding_multiplier: float = 1.0,
         output_multiplier: float = 1.0,
+        output_delta: bool = False,
         **kwargs: Any,  # noqa: ANN401
     ) -> None:
         super().__init__(**kwargs)
@@ -38,6 +40,9 @@ class ScalingLlamaConfig(LlamaConfig):
         # alpha_out: a constant on the logits, for a frozen donor embedding whose row
         # norms differ from our init's (embedding-ml-transfer P0-2b); 1 leaves it out
         self.output_multiplier = output_multiplier
+        # embedding-ml-transfer A6b: a trainable d x d map on the readout side, logits =
+        # E (I + Delta) h with Delta starting at 0, so the run starts as the tied model
+        self.output_delta = output_delta
 
 
 class LlamaCausalLM(LlamaForCausalLM):
@@ -54,6 +59,13 @@ class LlamaCausalLM(LlamaForCausalLM):
             assert isinstance(layer, LlamaDecoderLayer)
             layer.self_attn.o_proj.register_forward_hook(self._scale_branch)
             layer.mlp.down_proj.register_forward_hook(self._scale_branch)
+
+        # Created after super().__init__, whose init pass has already drawn every other
+        # weight, so adding it leaves the rest of the init (and the RNG) as without it
+        self.output_delta: nn.Linear | None = None
+        if config.output_delta:
+            self.output_delta = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            nn.init.zeros_(self.output_delta.weight)
 
     def _scale_branch(
         self, module: nn.Module, inputs: tuple[torch.Tensor], output: torch.Tensor
@@ -76,7 +88,11 @@ class LlamaCausalLM(LlamaForCausalLM):
         std = self.config.initializer_range
 
         if module is self.lm_head:
-            # tied to the embedding right after init, so its own init never matters
+            if self.config.tie_word_embeddings:
+                # tied to the embedding right after init, so its own init never matters
+                return
+            # embedding-ml-transfer A6a: an untied head, drawn like the embedding
+            nn.init.normal_(module.weight, std=std)
             return
         if isinstance(module, nn.Linear):
             if module.in_features == self.config.hidden_size:
@@ -119,6 +135,9 @@ class LlamaCausalLM(LlamaForCausalLM):
         readout_hidden = outputs.last_hidden_state / self.width_multiplier
         if self.config.output_multiplier != 1.0:
             readout_hidden = readout_hidden * self.config.output_multiplier
+        if self.output_delta is not None:
+            # (I + Delta) h: logits = E (I + Delta) h through the tied lm_head below
+            readout_hidden = readout_hidden + self.output_delta(readout_hidden)
         if not return_logits:
             # Training and eval stop here: LinearCrossEntropySum applies lm_head.weight
             # chunk by chunk, so the full [B,T,V] logits are never materialized
@@ -138,8 +157,14 @@ class LlamaCausalLM(LlamaForCausalLM):
                 if k not in MUP_CONFIG_KEYS
             }
         )
+        # The readout map has no place in a plain Llama: it folds into an untied lm_head
+        if self.output_delta is not None:
+            plain_config.tie_word_embeddings = False
         plain = LlamaForCausalLM(plain_config)
-        plain.load_state_dict(self.state_dict())
+        state = {k: v for k, v in self.state_dict().items() if not k.startswith("output_delta.")}
+        if self.output_delta is not None:
+            state["lm_head.weight"] = self.lm_head.weight.clone()
+        plain.load_state_dict(state)
 
         # The branches are linear with no bias, so 1/m_L folds into their last weight
         for layer in plain.model.layers:
@@ -153,4 +178,14 @@ class LlamaCausalLM(LlamaForCausalLM):
         plain.model.embed_tokens.weight.mul_(alpha)
         plain.model.norm.weight.div_(self.width_multiplier * alpha)
         plain.model.norm.weight.mul_(self.config.output_multiplier)
+        if not plain_config.tie_word_embeddings:
+            # Untied: the gain above divided the logits by alpha, which a tied embedding
+            # multiplied back in. Here the head carries it itself, after (I + Delta)
+            head = plain.lm_head.weight
+            if self.output_delta is not None:
+                delta = self.output_delta.weight.to(head.dtype)
+                head.copy_(head + head @ delta)
+            head.mul_(alpha)
+        else:
+            assert plain.lm_head.weight is plain.model.embed_tokens.weight
         return plain

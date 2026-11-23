@@ -139,6 +139,19 @@ def parse_arguments() -> argparse.Namespace:
         "is built, so it gets no optimizer state, no weight decay and no all-reduce)",
     )
     parser.add_argument(
+        "--untie-output",
+        action="store_true",
+        help="embedding-ml-transfer A6a: an untied lm_head, initialized like the embedding "
+        "and trained by AdamW with --adamw-weight-decay; the embedding is input-only",
+    )
+    parser.add_argument(
+        "--output-delta",
+        action="store_true",
+        help="embedding-ml-transfer A6b: logits = E (I + Delta) h through the tied lm_head, "
+        "Delta a d x d matrix starting at 0 and trained by Muon, whose weight decay pulls "
+        "it back to 0, i.e. the map back to the identity",
+    )
+    parser.add_argument(
         "--softmax-keep",
         type=Path,
         help="masked softmax: a .npz whose 'keep' holds the vocab ids the logits cover "
@@ -358,6 +371,8 @@ def build_model_config(
     eos_token_id: int,
     vocab_size: int = VOCAB_SIZE,
     output_multiplier: float = 1.0,
+    untie_output: bool = False,
+    output_delta: bool = False,
 ) -> ScalingLlamaConfig:
     base_size = base_size or size
     return ScalingLlamaConfig(
@@ -366,6 +381,7 @@ def build_model_config(
         base_num_hidden_layers=base_size.num_layers,
         embedding_multiplier=embedding_multiplier,
         output_multiplier=output_multiplier,
+        output_delta=output_delta,
         vocab_size=vocab_size,
         hidden_size=size.hidden_size,
         intermediate_size=size.intermediate_size,
@@ -378,7 +394,7 @@ def build_model_config(
         hidden_act="silu",
         attention_bias=False,
         mlp_bias=False,
-        tie_word_embeddings=True,
+        tie_word_embeddings=not untie_output,
         bos_token_id=bos_token_id,
         eos_token_id=eos_token_id,
     )
@@ -412,7 +428,10 @@ def load_donor_embedding(
         embedding.requires_grad_(False)
 
     # The tie must survive both: lm_head is the same Parameter as the embedding
-    assert model.lm_head.weight is model.model.embed_tokens.weight, "tie broken"
+    if model.config.tie_word_embeddings:
+        assert model.lm_head.weight is model.model.embed_tokens.weight, "tie broken"
+    else:
+        assert model.lm_head.weight is not model.model.embed_tokens.weight
 
 
 def hold_dropped_rows(
@@ -499,6 +518,8 @@ def main() -> None:
         eos_token_id,
         arguments.vocab_size,
         arguments.output_multiplier,
+        arguments.untie_output,
+        arguments.output_delta,
     )
     model = LlamaCausalLM(model_config).to(device)
     load_donor_embedding(
@@ -564,7 +585,10 @@ def main() -> None:
         keep_ids = torch.from_numpy(
             numpy.load(arguments.softmax_keep)["keep"].astype("int64")
         ).to(device)
-        embedding = model.model.embed_tokens.weight
+        # The output weight is the one the masked softmax leaves out rows of: the tied
+        # embedding, or with --untie-output the separate head (the input embedding then
+        # gets gradients only on rows that occur as inputs, which are all kept)
+        embedding = model.lm_head.weight
         if embedding.requires_grad:
             dropped = torch.ones(model_config.vocab_size, dtype=torch.bool, device=device)
             dropped[keep_ids] = False

@@ -84,13 +84,17 @@ def build_muon_adamw(
         if not parameter.requires_grad:
             continue
 
-        if parameter.ndim == 2 and ".layers." in f".{name}":
+        # output_delta (embedding-ml-transfer A6b) is a d x d hidden-to-hidden map like
+        # the layers' own, so it takes Muon and its width-scaled decay too
+        if parameter.ndim == 2 and (
+            ".layers." in f".{name}" or name.startswith("output_delta.")
+        ):
             fan_in = parameter.shape[1]
             if fan_in not in muon_parameters:
                 raise ValueError(f"{name}: unexpected fan_in {fan_in}")
             muon_parameters[fan_in].append(parameter)
         elif parameter.ndim == 2:
-            # the tied embedding / output layer
+            # the tied embedding / output layer (or, untied, the embedding and the head)
             adamw_decay_parameters.append(parameter)
         else:
             adamw_no_decay_parameters.append(parameter)

@@ -71,6 +71,20 @@ a1-mask150)
     # embedding-ml-transfer-p0-2b-150m-5b-oracle-mlr0.04-ein0.5-eout0.5 (same settings)
     model=t1-l12 scale=150m steps=4768 warmup=150 tokens=5b hours=3 variant=-mask
     ;;
+a6a)
+    # Untied: the frozen Oracle_Emb is input-only, the output is a separate head [V, d]
+    # drawn like an embedding (std 0.02) and trained by AdamW at adamw-lr 0.006 with the
+    # default wd 0.1 (HP_trainable, the setting the tied trainable embedding was tuned
+    # at); its rows outside the keep set get no gradient and are held against decay.
+    # A1's multipliers. Only the head differs from A1
+    extra=(--untie-output)
+    ;;
+a6b)
+    # Frozen tied Oracle_Emb read out through logits = E (I + Delta) h: Delta (d x d)
+    # starts at 0, so step 0 is A1 exactly, and Muon trains it at muon-lr 0.04 with its
+    # default width-scaled decay, which pulls the map back to the identity, not to 0
+    extra=(--output-delta)
+    ;;
 *)
     echo "unknown experiment $experiment" >&2
     exit 1

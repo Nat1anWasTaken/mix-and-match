@@ -242,12 +242,26 @@ def bootstrap(
     return float(value), float(low), float(high)
 
 
+def row_weights(model: LlamaForCausalLM) -> list[torch.Tensor]:
+    """
+    The matrices whose rows are tokens: the tied embedding, or for an untied export
+    (Phase 1 A6a's separate head, A6b's lm_head = alpha E (I + Delta)) the embedding and
+    the head. A row operation (Floor, shuffle) is applied to each with the same rows, which
+    for A6b is the same as applying it to E, since row v of E (I + Delta) is row v of E
+    times a fixed matrix
+    """
+    embedding = model.model.embed_tokens.weight
+    if model.lm_head.weight is embedding:
+        return [embedding]
+    assert not model.config.tie_word_embeddings, "the export lost its tie"
+    return [embedding, model.lm_head.weight]
+
+
 def reset_floor_rows(
     model: LlamaForCausalLM, categories: numpy.ndarray, keep: numpy.ndarray | None = None
 ) -> dict:
-    embedding = model.model.embed_tokens.weight
-    assert model.lm_head.weight is embedding, "the export lost its tie"
-    vocab = embedding.shape[0]
+    weights = row_weights(model)
+    vocab = weights[0].shape[0]
     ids = numpy.arange(vocab)
     trained = (ids < FIRST_SPECIAL) & (categories[:vocab] != BAN)
     # Chinese V_ban, and every row past the base vocab: Fake-French and the padding
@@ -260,8 +274,9 @@ def reset_floor_rows(
         reset |= ~kept
 
     with torch.no_grad():
-        mean = embedding[torch.from_numpy(trained).to(embedding.device)].float().mean(0)
-        embedding[torch.from_numpy(reset).to(embedding.device)] = mean.to(embedding.dtype)
+        for embedding in weights:
+            mean = embedding[torch.from_numpy(trained).to(embedding.device)].float().mean(0)
+            embedding[torch.from_numpy(reset).to(embedding.device)] = mean.to(embedding.dtype)
 
     return {"floor_rows_reset": int(reset.sum()), "floor_mean_over": int(trained.sum())}
 
@@ -276,9 +291,8 @@ def shuffle_rows(
     lost. Every other row is untouched, so a softmax over the whole vocab sees the same
     set of logits and the L_train BPB does not move.
     """
-    embedding = model.model.embed_tokens.weight
-    assert model.lm_head.weight is embedding, "the export lost its tie"
-    vocab = embedding.shape[0]
+    weights = row_weights(model)
+    vocab = weights[0].shape[0]
     ids = numpy.arange(vocab)
     groups = {
         "zh": ids[(ids < BASE_VOCAB) & (categories[:vocab] == BAN)],
@@ -291,9 +305,10 @@ def shuffle_rows(
             if rows.size == 0:
                 continue
             order = generator.permutation(rows)
-            source = torch.from_numpy(order).to(embedding.device)
-            target = torch.from_numpy(rows).to(embedding.device)
-            embedding[target] = embedding[source].clone()
+            for embedding in weights:
+                source = torch.from_numpy(order).to(embedding.device)
+                target = torch.from_numpy(rows).to(embedding.device)
+                embedding[target] = embedding[source].clone()
             report[f"shuffle_rows_{name}"] = int(rows.size)
             report[f"shuffle_fixed_{name}"] = int((order == rows).sum())
     return report
