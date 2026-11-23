@@ -46,6 +46,15 @@ Next to the column it writes, like a compiler beside its recipe:
 join_onto_shards rewrites every shard, so record.json, written once the join is done,
 describes every shard of the column. A rerun that finds the column complete changes
 nothing, opens no wandb run and keeps the old record.
+
+A slow scorer (a fastText model over tens of millions of documents) can be split over
+several nodes: N jobs with --part 0/N ... --part N-1/N each scan every N-th source
+fragment and save their (row address, value) pairs under meta/<kind>/parts/, without
+touching the column; then one job with --merge-parts N joins all of them onto the
+shards exactly as a single job would, writes record.json and scorer.py, logs the
+summary, and deletes parts/. Parts log to the console only; the merge opens the run.
+Every part and the merge must use the same scorer settings (info.json is checked by
+each), and the merge refuses to run until all N parts are there.
 """
 
 import argparse
@@ -81,6 +90,7 @@ from .text import ScorerFactory, scan_texts
 # prepare.py's project, so a store's prepare and score runs sit side by side
 WANDB_PROJECT = "lab7-data-curation"
 RECORD_FILE = "record.json"
+PARTS = "parts"
 SCORER_FILE = "scorer.py"
 
 type Logger = ConsoleLogger | WandbLogger
@@ -222,6 +232,55 @@ def finish(logger: Logger, store: ShardStore, kind: str, seconds: float) -> None
     logger.finish()
 
 
+def parse_part(value: str) -> tuple[int, int]:
+    """
+    --part I/N: this job's index and the number of parts
+    """
+    index, _, parts = value.partition("/")
+
+    try:
+        part = int(index), int(parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected I/N, not {value!r}") from None
+
+    if not 0 <= part[0] < part[1]:
+        raise argparse.ArgumentTypeError(f"need 0 <= I < N, not {value!r}")
+
+    return part
+
+
+def part_path(kind: str, index: int, parts: int, array: str) -> str:
+    return f"{META}/{kind}/{PARTS}/{index}-of-{parts}.{array}.npy"
+
+
+def merge_parts(
+    store: ShardStore, kind: str, parts: int
+) -> tuple[numpy.ndarray, numpy.ndarray]:
+    """
+    Every part's (addresses, values), concatenated
+    """
+    missing = [
+        index
+        for index in range(parts)
+        if not store.has_array(part_path(kind, index, parts, "values"))
+    ]
+
+    if missing:
+        raise FileNotFoundError(
+            f"{store.uri} meta/{kind} lacks parts {missing} of {parts}; run them first"
+        )
+
+    addresses = [
+        store.read_array(part_path(kind, index, parts, "addresses"))
+        for index in range(parts)
+    ]
+    values = [
+        store.read_array(part_path(kind, index, parts, "values"))
+        for index in range(parts)
+    ]
+    return numpy.concatenate(addresses), numpy.concatenate(values)
+
+
 def score(
     context: Context,
     scorer: Scorer,
@@ -230,6 +289,8 @@ def score(
     run_name: str | None,
 ) -> None:
     store, kind, workers = context.store, context.kind, context.workers
+    part: tuple[int, int] | None = context.arguments.part
+    merge: int | None = context.arguments.merge_parts
     source, version = source_dataset(store)
     info = {**scorer.info, "dataset": source, "dataset_version": version}
     ensure_info(store, kind, info)
@@ -238,13 +299,47 @@ def score(
         print(f"{store.uri} already has every shard of meta/{kind}", flush=True)
         return
 
-    dataset = open_source_dataset(store, context.mirror)
     fragment_ids = source_fragment_ids(store)
-    logger = open_logger(
-        run_name,
-        {**vars(context.arguments), **info, "kind": kind},
-        context.arguments.wandb_project,
-    )
+
+    if merge is not None:
+        start = time.monotonic()
+        addresses, values = merge_parts(store, kind, merge)
+        logger = open_logger(
+            run_name,
+            {**vars(context.arguments), **info, "kind": kind},
+            context.arguments.wandb_project,
+        )
+        join_onto_shards(store, kind, addresses, values, workers)
+        store.write_json(f"{META}/{kind}/{RECORD_FILE}", dict(record))
+        store.write_text(f"{META}/{kind}/{SCORER_FILE}", scorer_source)
+        store.delete_directory(f"{META}/{kind}/{PARTS}")
+        print(f"wrote meta/{kind} for {store.uri} from {merge} parts", flush=True)
+        finish(logger, store, kind, time.monotonic() - start)
+        return
+
+    if part is not None:
+        index, parts = part
+
+        if store.has_array(part_path(kind, index, parts, "values")):
+            print(f"{store.uri} already has part {index}/{parts} of meta/{kind}")
+            return
+
+        if parts > len(fragment_ids):
+            raise ValueError(
+                f"{store.uri} has {len(fragment_ids)} source fragments, "
+                f"fewer than {parts} parts"
+            )
+
+        fragment_ids = fragment_ids[index::parts]
+        logger: Logger = ConsoleLogger()
+    else:
+        logger = open_logger(
+            run_name,
+            {**vars(context.arguments), **info, "kind": kind},
+            context.arguments.wandb_project,
+        )
+
+    dataset = open_source_dataset(store, context.mirror)
     progress = Progress(logger, len(fragment_ids))
 
     if isinstance(scorer, TextScorer):
@@ -261,6 +356,17 @@ def score(
             raise ValueError(
                 f"transform returned shape {values.shape} for {addresses.size} rows"
             )
+
+    if part is not None:
+        # Values first: the merge counts a part as there once its values are
+        store.write_array(part_path(kind, *part, "addresses"), addresses)
+        store.write_array(part_path(kind, *part, "values"), values)
+        print(
+            f"wrote part {part[0]}/{part[1]} of meta/{kind} for {store.uri}: "
+            f"{addresses.size} rows of {len(fragment_ids)} fragments",
+            flush=True,
+        )
+        return
 
     join_onto_shards(store, kind, addresses, values, workers)
     # After the join, so the record describes every shard
@@ -304,6 +410,19 @@ def run(
         "--wandb-project",
         default=WANDB_PROJECT,
         help=f"wandb project to log to (default {WANDB_PROJECT}, the lab's)",
+    )
+    split = parser.add_mutually_exclusive_group()
+    split.add_argument(
+        "--part",
+        type=parse_part,
+        metavar="I/N",
+        help="scan only every N-th source fragment, starting at I, into meta/<kind>/parts/",
+    )
+    split.add_argument(
+        "--merge-parts",
+        type=int,
+        metavar="N",
+        help="join the N parts in meta/<kind>/parts/ onto the shards",
     )
     add_stage_arguments(parser)
 
