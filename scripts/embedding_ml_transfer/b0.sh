@@ -19,8 +19,8 @@ if [[ $which == upper ]]; then
 else
     recipe=multi-train-20b-v2 steps=19073 warmup=572 tokens=20b
 fi
-name=embedding-ml-transfer-b0-$which-300m-$tokens
-SBATCH_EXTRA="--nodelist=25a-hgpn$node" scripts/embedding_ml_transfer/launch.sh "$commit" "$name" 1 12 -- \
+name=embedding-ml-transfer-b0-$which-300m-$tokens${B0_SUFFIX:-}
+SBATCH_EXTRA="${node:+--nodelist=25a-hgpn$node}" scripts/embedding_ml_transfer/launch.sh "$commit" "$name" 1 12 -- \
     --recipe s3://embedding-ml-transfer/recipes/$recipe \
     --recipe-cache /work/u9216411/acd115198/recipe-cache --mup-base-size t1-l12 \
     --vocab-size 181632 --global-batch-tokens $BATCH --micro-batch-size 8 \
