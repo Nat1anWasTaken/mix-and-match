@@ -53,6 +53,10 @@ a4c)
     # differs only in the L_train rows being trainable
     embedding=("${trainable[@]}")
     ;;
+a4c-seed2)
+    # Plan §6 (revised 2026-11-24): A1 vs A4c is a key comparison, paired with A1-seed2
+    embedding=("${trainable[@]}") experiment=a4c variant=-seed2 seed=43
+    ;;
 a4a)
     # As A4c with the full softmax: the L_ban rows are trainable too and, as negatives,
     # pushed every step. A4a vs A4c is one switch, the mask
