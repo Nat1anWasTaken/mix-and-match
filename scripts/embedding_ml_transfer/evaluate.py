@@ -30,6 +30,14 @@ Fake-French ids, plus the never-used padding rows past them) is set to the mean 
 trained rows (ids below 151,643 that are not V_ban), on the tied embedding, so the
 output side moves with it. Rows from 151,643 up never enter a mean (AGENTS.md).
 
+For a run trained with the masked softmax (train.py --softmax-keep), the rows outside the
+keep set were never trained and still hold their random init. --floor-keep <npz> (with
+--floor) resets those too, every row not in the npz's 'keep', and takes the mean over the
+trained rows that are also kept, so no random row is left in the Floor's softmax.
+--softmax-keep <npz> scores with the training-time masked softmax instead: the logits of
+the rows outside 'keep' are -inf. A language (or Delta pair) with a target outside 'keep'
+cannot be scored that way and is skipped; in practice this scores L_train only.
+
 The checkpoint's HF directory is used: it is a plain Llama computing the same function
 as training (multipliers folded in), which is all scoring needs. Runs on one GPU.
 """
@@ -155,6 +163,7 @@ def score(
     batch_tokens: int,
     device: torch.device,
     subset: torch.Tensor | None = None,
+    allowed: torch.Tensor | None = None,
 ) -> numpy.ndarray:
     """
     Summed NLL in nats over each item's target positions: [N], or with subset (a [vocab]
@@ -162,7 +171,8 @@ def score(
     target count. For a target y in V_L, -log p(y) = within + select, with
     within = -log p(y | y in V_L) = lse_L - z_y (the ranking inside the language) and
     select = -log P(V_L) = lse_all - lse_L (choosing the language). A target outside V_L
-    has no within/select split: its whole -log p(y) goes to outside
+    has no within/select split: its whole -log p(y) goes to outside. allowed (a [vocab]
+    bool, --softmax-keep) masks every other row out of the softmax
     """
     order = sorted(range(len(items)), key=lambda index: -items[index].tokens.size)
     result = numpy.zeros(len(items) if subset is None else (len(items), 5), dtype=numpy.float64)
@@ -191,6 +201,8 @@ def score(
             # Position t predicts token t + 1: targets [start, end) come from [start-1, end-1)
             states = hidden[row, item.start - 1 : item.end - 1]
             logits = (states @ weight.T.to(states.dtype)).float()
+            if allowed is not None:
+                logits = logits.masked_fill(~allowed, float("-inf"))
             targets = input_ids[row, item.start : item.end]
             if subset is None:
                 nll = torch.nn.functional.cross_entropy(logits, targets, reduction="sum")
@@ -223,7 +235,9 @@ def bootstrap(
     return float(value), float(low), float(high)
 
 
-def reset_floor_rows(model: LlamaForCausalLM, categories: numpy.ndarray) -> dict:
+def reset_floor_rows(
+    model: LlamaForCausalLM, categories: numpy.ndarray, keep: numpy.ndarray | None = None
+) -> dict:
     embedding = model.model.embed_tokens.weight
     assert model.lm_head.weight is embedding, "the export lost its tie"
     vocab = embedding.shape[0]
@@ -231,6 +245,12 @@ def reset_floor_rows(model: LlamaForCausalLM, categories: numpy.ndarray) -> dict
     trained = (ids < FIRST_SPECIAL) & (categories[:vocab] != BAN)
     # Chinese V_ban, and every row past the base vocab: Fake-French and the padding
     reset = (categories[:vocab] == BAN) | (ids >= BASE_VOCAB)
+    if keep is not None:
+        # Masked-softmax run: the rows outside keep never left their init
+        kept = numpy.zeros(vocab, dtype=bool)
+        kept[keep[keep < vocab]] = True
+        trained &= kept
+        reset |= ~kept
 
     with torch.no_grad():
         mean = embedding[torch.from_numpy(trained).to(embedding.device)].float().mean(0)
@@ -351,6 +371,16 @@ def main() -> None:
     parser.add_argument("--fineweb2", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True, help="<dir>/<name>")
     parser.add_argument("--floor", action="store_true", help="B0-Lower's Floor")
+    parser.add_argument(
+        "--floor-keep",
+        type=Path,
+        help="with --floor: the run's --softmax-keep npz; also reset every row outside it",
+    )
+    parser.add_argument(
+        "--softmax-keep",
+        type=Path,
+        help="score with the masked softmax of this npz's 'keep' (skips what it cannot score)",
+    )
     parser.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B-Base")
     parser.add_argument("--fineweb2-documents", type=int, default=1000)
     parser.add_argument("--max-length", type=int, default=4096)
@@ -381,8 +411,29 @@ def main() -> None:
         "vocab_size": vocab,
         "metrics": {},
     }
+    if arguments.floor_keep is not None and not arguments.floor:
+        parser.error("--floor-keep needs --floor")
     if arguments.floor:
-        report |= reset_floor_rows(model, categories)
+        floor_keep = (
+            numpy.load(arguments.floor_keep)["keep"] if arguments.floor_keep is not None else None
+        )
+        report |= reset_floor_rows(model, categories, floor_keep)
+        report["floor_keep"] = str(arguments.floor_keep) if floor_keep is not None else None
+    allowed: torch.Tensor | None = None
+    allowed_cpu: numpy.ndarray | None = None
+    if arguments.softmax_keep is not None:
+        keep = numpy.load(arguments.softmax_keep)["keep"]
+        allowed_cpu = numpy.zeros(vocab, dtype=bool)
+        allowed_cpu[keep[keep < vocab]] = True
+        allowed = torch.from_numpy(allowed_cpu).to(device)
+        report["softmax_keep"] = str(arguments.softmax_keep)
+        report["softmax_keep_rows"] = int(allowed_cpu.sum())
+
+    def scorable(items: list[Item]) -> bool:
+        """Every target in the masked softmax (always true without --softmax-keep)"""
+        return allowed_cpu is None or all(
+            allowed_cpu[item.tokens[item.start : item.end]].all() for item in items
+        )
 
     fake = (
         FakeFrench(arguments.fake_french / "fake_french.npz")
@@ -421,8 +472,11 @@ def main() -> None:
             if "fake" in language and not has_fake:
                 continue
             items, owner = flatten(groups)
+            if not scorable(items):
+                print(f"{set_name}/{language}: a target outside --softmax-keep, skipped", flush=True)
+                continue
             subset = language_sets.get(SPLIT_LANGUAGES.get(language, ""))
-            scored = score(model, items, arguments.batch_tokens, device, subset)
+            scored = score(model, items, arguments.batch_tokens, device, subset, allowed)
             columns = scored if scored.ndim == 2 else scored[:, None]
             # Item sums -> unit (sentence / document) sums, column by column
             sums = numpy.stack(
@@ -459,8 +513,11 @@ def main() -> None:
             if "fake" in (source, target) and not has_fake:
                 continue
             real, unrelated, utf8 = delta_items(encoder, arguments.flores, source, target)
-            nll_real = score(model, real, arguments.batch_tokens, device)
-            nll_unrelated = score(model, unrelated, arguments.batch_tokens, device)
+            if not (scorable(real) and scorable(unrelated)):
+                print(f"delta/{source}-{target}: a target outside --softmax-keep, skipped", flush=True)
+                continue
+            nll_real = score(model, real, arguments.batch_tokens, device, allowed=allowed)
+            nll_unrelated = score(model, unrelated, arguments.batch_tokens, device, allowed=allowed)
             key = f"delta/{source}-{target}"
             arrays[f"{key}/nll_real"] = nll_real
             arrays[f"{key}/nll_unrelated"] = nll_unrelated
@@ -480,9 +537,10 @@ def main() -> None:
             print(f"{key}: {value:.4f} [{low:.4f}, {high:.4f}]", flush=True)
 
     train_keys = [f"bpb/flores/{short}" for short in ("en", "es", "de", "ru")]
-    report["metrics"]["bpb/flores/l_train_mean"] = {
-        "value": float(numpy.mean([report["metrics"][k]["value"] for k in train_keys]))
-    }
+    if all(k in report["metrics"] for k in train_keys):
+        report["metrics"]["bpb/flores/l_train_mean"] = {
+            "value": float(numpy.mean([report["metrics"][k]["value"] for k in train_keys]))
+        }
     report["seconds"] = time.time() - started
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     Path(f"{arguments.output}.json").write_text(json.dumps(report, indent=2) + "\n")
