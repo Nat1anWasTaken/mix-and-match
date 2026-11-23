@@ -50,6 +50,11 @@ checkpoint is what the token-level alignment is worth. The self-Floor is --floor
 same checkpoint. Real French has no rows of its own (it shares L_train's), so neither
 control applies to it.
 
+--rescale-rows <keep npz> is A4's scale control: each L_ban language's own rows are
+multiplied by rms(trained L_train rows) / rms(its rows), on the input side only
+(--rescale-side input, the head is untied first) or on the tied matrix (both). It splits
+A4c's loss into the norm mismatch that wd 0 creates and the drift of the directions.
+
 The checkpoint's HF directory is used: it is a plain Llama computing the same function
 as training (multipliers folded in), which is all scoring needs. Runs on one GPU.
 """
@@ -365,6 +370,54 @@ def center_rows(
     return report
 
 
+def rescale_rows(
+    model: LlamaForCausalLM,
+    categories: numpy.ndarray,
+    fake_rows: int,
+    keep: numpy.ndarray,
+    side: str,
+) -> dict:
+    """
+    A4's scale control: with a trainable embedding and wd 0 (A4c) the L_train rows grow
+    while the frozen L_ban rows keep Oracle_Emb's norm, so an L_ban token enters the body
+    much smaller than the L_train tokens it was aligned with. Multiply each L_ban group's
+    own rows (Chinese V_ban; the Fake-French rows) by one scalar, rms(L_train) / rms(group),
+    with L_train = the trained rows (in 'keep', below 151,643, not V_ban). Directions are
+    untouched, so what is left of the gap to A1 is direction drift. side 'input' first
+    unties the head (a copy of the old rows) so only the input side changes; 'both'
+    rescales the tied matrix, i.e. the output logits of those tokens too
+    """
+    if side == "input":
+        assert model.lm_head.weight is model.model.embed_tokens.weight, "already untied"
+        model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())
+        model.config.tie_word_embeddings = False
+    embedding = model.model.embed_tokens.weight
+    vocab = embedding.shape[0]
+    ids = numpy.arange(vocab)
+    kept = numpy.zeros(vocab, dtype=bool)
+    kept[keep[keep < vocab]] = True
+    train = (ids < FIRST_SPECIAL) & (categories[:vocab] != BAN) & kept
+    own = {
+        "zh": (ids < BASE_VOCAB) & (categories[:vocab] == BAN),
+        "fake": (ids >= BASE_VOCAB) & (ids < BASE_VOCAB + fake_rows),
+    }
+    report = {"rescale_side": side}
+    with torch.no_grad():
+        def rms(rows: numpy.ndarray) -> float:
+            picked = embedding[torch.from_numpy(rows).to(embedding.device)]
+            return float(picked.double().pow(2).mean().sqrt())
+
+        target = rms(train)
+        report["rescale_rms_l_train"] = target
+        for name, rows in own.items():
+            if not rows.any():
+                continue
+            factor = target / rms(rows)
+            embedding[torch.from_numpy(rows).to(embedding.device)] *= factor
+            report[f"rescale_factor_{name}"] = factor
+    return report
+
+
 def flores_items(
     encoder: Encoder, flores: Path, max_length: int
 ) -> dict[str, tuple[list[list[Item]], numpy.ndarray]]:
@@ -500,6 +553,19 @@ def main() -> None:
         "'counts'); moves each L_ban language's own rows by mu(L_train) - mu(L), "
         "frequency weighted (needs --language-sets for the L_ban counts)",
     )
+    parser.add_argument(
+        "--rescale-rows",
+        type=Path,
+        help="A4 scale control: the run's --softmax-keep npz; scales each L_ban language's "
+        "own rows to the trained L_train rows' RMS (see --rescale-side)",
+    )
+    parser.add_argument(
+        "--rescale-side",
+        choices=["input", "both"],
+        default="input",
+        help="with --rescale-rows: 'input' unties the head first and rescales only the "
+        "embedding; 'both' rescales the tied matrix",
+    )
     parser.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B-Base")
     parser.add_argument("--fineweb2-documents", type=int, default=1000)
     parser.add_argument("--max-length", type=int, default=4096)
@@ -566,6 +632,14 @@ def main() -> None:
         report |= shuffle_rows(
             model, categories, fake.members.size if has_fake else 0, arguments.shuffle_seed
         )
+    if arguments.rescale_rows is not None:
+        if arguments.floor or arguments.shuffle_seed is not None or arguments.center_rows:
+            parser.error("--rescale-rows is a control of its own")
+        report |= rescale_rows(
+            model, categories, fake.members.size if has_fake else 0,
+            numpy.load(arguments.rescale_rows)["keep"], arguments.rescale_side,
+        )
+        report["rescale_rows"] = str(arguments.rescale_rows)
     if not has_fake:
         print(f"vocab {vocab}: no Fake-French table or rows, skipping fake", flush=True)
     encoder = Encoder(arguments.tokenizer, fake)
