@@ -173,7 +173,20 @@ class LinearCrossEntropySum:
     muP readout 1/m_d) and the tied output weight instead of logits
     """
 
-    def __init__(self, chunk_tokens: int = 16384, compile: bool = True) -> None:
+    def __init__(
+        self,
+        chunk_tokens: int = 16384,
+        compile: bool = True,
+        keep_ids: Tensor | None = None,
+        vocab_size: int | None = None,
+    ) -> None:
+        """
+        keep_ids: the masked softmax (embedding-ml-transfer, plan Phase 1 revision). The
+        logits cover only these vocab rows, so every other row is never a negative: it
+        gets no gradient from the softmax denominator and the hidden states are never
+        pushed away from it. Sorted unique ids in [0, vocab_size); every target must be
+        one of them
+        """
         if chunk_tokens <= 0:
             raise ValueError("chunk_tokens must be greater than 0")
         self.chunk_tokens = chunk_tokens
@@ -183,6 +196,22 @@ class LinearCrossEntropySum:
             torch.compile(_chunk_step, dynamic=False) if compile else _chunk_step
         )
 
+        self.keep_ids = keep_ids
+        self.remap: Tensor | None = None
+        if keep_ids is not None:
+            if vocab_size is None:
+                raise ValueError("keep_ids needs vocab_size")
+            if keep_ids.ndim != 1 or keep_ids.numel() == 0:
+                raise ValueError("keep_ids must be a non-empty 1D tensor")
+            if not bool((keep_ids[1:] > keep_ids[:-1]).all()):
+                raise ValueError("keep_ids must be sorted and unique")
+            if int(keep_ids[0]) < 0 or int(keep_ids[-1]) >= vocab_size:
+                raise ValueError(f"keep_ids must lie in [0, {vocab_size})")
+            # Vocab id -> its row in the kept [K, d] weight, -1 for a dropped id
+            remap = torch.full((vocab_size,), -1, dtype=torch.long, device=keep_ids.device)
+            remap[keep_ids] = torch.arange(keep_ids.numel(), device=keep_ids.device)
+            self.remap = remap
+
     def __call__(self, hidden: Tensor, weight: Tensor, labels: Tensor) -> LossOutput:
         # Position t predicts token t + 1. Shift the labels left and give the last
         # position no target, instead of slicing the hidden states
@@ -191,6 +220,21 @@ class LinearCrossEntropySum:
         ).reshape(-1)
         flat_hidden = hidden.reshape(-1, hidden.size(-1))
         num_tokens = (shifted_labels != IGNORE_INDEX).sum()
+
+        if self.keep_ids is not None:
+            assert self.remap is not None
+            # [K, d]: index_select's backward scatters the gradient into the full
+            # [V, d] weight, zero on the dropped rows
+            weight = weight.index_select(0, self.keep_ids)
+            scored = shifted_labels != IGNORE_INDEX
+            remapped = self.remap[torch.where(scored, shifted_labels, 0)]
+            # A target outside the kept set would be silently scored as a wrong row;
+            # assert on device, so no host sync per micro step
+            torch._assert_async(
+                (remapped >= 0).logical_or(~scored).all(),
+                "masked softmax: a target is not in keep_ids",
+            )
+            shifted_labels = torch.where(scored, remapped, IGNORE_INDEX)
 
         needs_grad = torch.is_grad_enabled() and (
             flat_hidden.requires_grad or weight.requires_grad
