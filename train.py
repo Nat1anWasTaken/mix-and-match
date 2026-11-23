@@ -139,6 +139,13 @@ def parse_arguments() -> argparse.Namespace:
         "is built, so it gets no optimizer state, no weight decay and no all-reduce)",
     )
     parser.add_argument(
+        "--embedding-lr-multiplier",
+        type=float,
+        default=1.0,
+        help="the tied embedding's AdamW lr is --adamw-lr times this; the RMSNorm gains "
+        "keep --adamw-lr (embedding-ml-transfer A4a-lr0.1)",
+    )
+    parser.add_argument(
         "--untie-output",
         action="store_true",
         help="embedding-ml-transfer A6a: an untied lm_head, initialized like the embedding "
@@ -546,6 +553,7 @@ def main() -> None:
         adamw_weight_decay=arguments.adamw_weight_decay,
         adamw_betas=(arguments.adamw_beta1, arguments.adamw_beta2),
         adamw_eps=arguments.adamw_eps,
+        embedding_lr_multiplier=arguments.embedding_lr_multiplier,
     )
     scheduler = build_warmup_stable_decay(
         optimizer,

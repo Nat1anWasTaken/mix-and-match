@@ -58,6 +58,7 @@ def build_muon_adamw(
     adamw_weight_decay: float,
     adamw_betas: tuple[float, float],
     adamw_eps: float = 1e-12,
+    embedding_lr_multiplier: float = 1.0,
 ) -> CombinedOptimizer:
     """
     Muon in spectral units on every 2D weight inside the decoder layers, AdamW on the
@@ -111,13 +112,33 @@ def build_muon_adamw(
         lr=muon_lr,
         adjust_lr_fn="spectral_unclamped",
     )
+    groups = [
+        {
+            "params": adamw_decay_parameters,
+            "weight_decay": adamw_weight_decay,
+            "name": "adamw",
+        },
+    ]
+    if embedding_lr_multiplier != 1.0:
+        # embedding-ml-transfer A4a-lr0.1: the input embedding in a group of its own at
+        # adamw_lr x multiplier, so the RMSNorm gains (and an untied head) keep adamw_lr.
+        # The schedule scales every group from its own starting lr, so the ratio holds
+        embedding = model.model.embed_tokens.weight
+        if not any(p is embedding for p in adamw_decay_parameters):
+            raise ValueError("--embedding-lr-multiplier: the embedding is not trained")
+        groups[0]["params"] = [p for p in adamw_decay_parameters if p is not embedding]
+        groups.append(
+            {
+                "params": [embedding],
+                "weight_decay": adamw_weight_decay,
+                "lr": adamw_lr * embedding_lr_multiplier,
+                "name": "adamw_embedding",
+            }
+        )
     adamw = AdamW(
         [
-            {
-                "params": adamw_decay_parameters,
-                "weight_decay": adamw_weight_decay,
-                "name": "adamw",
-            },
+            # Tied, the embedding was the decayed group's only member: drop it if empty
+            *(group for group in groups if group["params"]),
             {
                 "params": adamw_no_decay_parameters,
                 "weight_decay": 0.0,

@@ -62,6 +62,12 @@ a4a)
     # pushed every step. A4a vs A4c is one switch, the mask
     embedding=("${trainable[@]}") keep=""
     ;;
+a4a-lr0.1)
+    # A4a's pre-registered child (A4a §1): if A4a's alignment collapses, the same run with
+    # the embedding's lr at 0.1x (adamw-lr 0.006 x 0.1 = 0.0006); the RMSNorm gains keep 0.006
+    embedding=("${trainable[@]}") keep="" experiment=a4a variant=-lr0.1
+    extra=(--embedding-lr-multiplier 0.1)
+    ;;
 a4b)
     # As A4a with the default embedding wd 0.1
     embedding=(--donor-embedding "$donor") keep=""
