@@ -7,6 +7,7 @@ import os
 from collections import namedtuple
 from pathlib import Path
 
+import numpy
 import torch
 
 from src.checkpoint import PretrainedCheckpointer
@@ -136,6 +137,14 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="don't train the tied embedding (requires_grad False before the optimizer "
         "is built, so it gets no optimizer state, no weight decay and no all-reduce)",
+    )
+    parser.add_argument(
+        "--softmax-keep",
+        type=Path,
+        help="masked softmax: a .npz whose 'keep' holds the vocab ids the logits cover "
+        "(scripts/embedding_ml_transfer/token_counts.py, the ids counted > 0 in the "
+        "training set). Every other embedding row is never a negative and is held fixed "
+        "against weight decay",
     )
     parser.add_argument("--muon-lr", type=float, default=0.02)
     parser.add_argument("--adamw-lr", type=float, default=3e-3)
@@ -406,6 +415,34 @@ def load_donor_embedding(
     assert model.lm_head.weight is model.model.embed_tokens.weight, "tie broken"
 
 
+def hold_dropped_rows(
+    adamw: torch.optim.Optimizer, embedding: torch.nn.Parameter, dropped: torch.Tensor
+) -> None:
+    """
+    Keep the masked-out embedding rows exactly where they are. They get no gradient
+    (never an input in the training set, never in the masked softmax), so Adam moves them
+    by 0, but AdamW's decoupled weight decay would still shrink them every step. Save them
+    before each AdamW step and write them back after it. The first step also checks that
+    their gradient really is zero, so the write-back can't hide a leak
+    """
+    saved: dict[str, torch.Tensor] = {}
+
+    def before(_optimizer: torch.optim.Optimizer, _args: object, _kwargs: object) -> None:
+        if "checked" not in saved and embedding.grad is not None:
+            leak = embedding.grad.index_select(0, dropped).abs().max().item()
+            if leak != 0:
+                raise RuntimeError(f"masked rows have a nonzero gradient ({leak:.3g})")
+            saved["checked"] = torch.ones(())
+        saved["rows"] = embedding.detach().index_select(0, dropped)
+
+    def after(_optimizer: torch.optim.Optimizer, _args: object, _kwargs: object) -> None:
+        with torch.no_grad():
+            embedding.index_copy_(0, dropped, saved.pop("rows"))
+
+    adamw.register_step_pre_hook(before)
+    adamw.register_step_post_hook(after)
+
+
 def main() -> None:
     arguments = parse_arguments()
     torch.manual_seed(arguments.seed)
@@ -522,8 +559,28 @@ def main() -> None:
         if training_model is not model:
             model.compile()
 
+    keep_ids = None
+    if arguments.softmax_keep is not None:
+        keep_ids = torch.from_numpy(
+            numpy.load(arguments.softmax_keep)["keep"].astype("int64")
+        ).to(device)
+        embedding = model.model.embed_tokens.weight
+        if embedding.requires_grad:
+            dropped = torch.ones(model_config.vocab_size, dtype=torch.bool, device=device)
+            dropped[keep_ids] = False
+            adamw = optimizer.optimizers[1]
+            assert any(p is embedding for g in adamw.param_groups for p in g["params"])
+            hold_dropped_rows(adamw, embedding, dropped.nonzero().squeeze(1))
+        if rank == 0:
+            print(
+                f"masked softmax: {keep_ids.numel():,} of {model_config.vocab_size:,} "
+                f"rows kept ({arguments.softmax_keep})"
+            )
     loss_fn = LinearCrossEntropySum(
-        chunk_tokens=arguments.ce_chunk_tokens, compile=arguments.compile
+        chunk_tokens=arguments.ce_chunk_tokens,
+        compile=arguments.compile,
+        keep_ids=keep_ids,
+        vocab_size=model_config.vocab_size,
     )
     recipe = load_recipe(arguments.recipe)
 
