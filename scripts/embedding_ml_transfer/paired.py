@@ -83,7 +83,8 @@ def main() -> None:
         summarize(key, diff.sum() / (LN2 * utf8.sum()), samples)
 
     for key in sorted(delta_metrics(a) & delta_metrics(b)):
-        utf8 = a[f"{key}/bytes"]
+        # delta_masked/<pair> shares delta/<pair>'s target bytes
+        utf8 = a.get(f"{key}/bytes", a.get(key.replace("delta_masked/", "delta/") + "/bytes"))
         gain_a = a[f"{key}/nll_unrelated"] - a[f"{key}/nll_real"]
         gain_b = b[f"{key}/nll_unrelated"] - b[f"{key}/nll_real"]
         if gain_a.shape != gain_b.shape:
