@@ -205,6 +205,11 @@ def parse_arguments() -> argparse.Namespace:
         help="default: flash_attention_3 on CUDA, else sdpa",
     )
     parser.add_argument("--no-wandb", action="store_true", help="log to console only")
+    parser.add_argument(
+        "--wandb-project",
+        default=WANDB_PROJECT,
+        help=f"wandb project to log to (default {WANDB_PROJECT}, the lab's)",
+    )
 
     arguments = parser.parse_args()
 
@@ -535,7 +540,9 @@ def main() -> None:
     if arguments.no_wandb or rank != 0:
         logger: ConsoleLogger | WandbLogger = ConsoleLogger()
     else:
-        logger = WandbLogger(WANDB_PROJECT, arguments.run_name, run_config)
+        logger = WandbLogger(
+            arguments.wandb_project, arguments.run_name, run_config
+        )
 
     trainer = Trainer(
         model=training_model,
