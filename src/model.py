@@ -183,7 +183,7 @@ class LlamaCausalLM(LlamaForCausalLM):
             # multiplied back in. Here the head carries it itself, after (I + Delta)
             head = plain.lm_head.weight
             if self.output_delta is not None:
-                delta = self.output_delta.weight.to(head.dtype)
+                delta = self.output_delta.weight.to(head.device, head.dtype)
                 head.copy_(head + head @ delta)
             head.mul_(alpha)
         else:
