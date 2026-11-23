@@ -14,7 +14,7 @@
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=200G
 #SBATCH --time=04:00:00
-#SBATCH --exclude=25a-hgpn[173-176]
+#SBATCH --exclude=25a-hgpn[069,141,173-176]
 #SBATCH --output=/work/u9216411/acd115198/embedding-ml-transfer-runs/logs/%x-%j.out
 
 set -euo pipefail
