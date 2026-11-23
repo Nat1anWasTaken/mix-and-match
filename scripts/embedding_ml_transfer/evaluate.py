@@ -76,6 +76,10 @@ DELTA_PAIRS = [
     ("en", "es"),
 ]
 SHOTS = 3
+# BPB sets split into within-language ranking / language selection, and their V_L file
+SPLIT_LANGUAGES = {
+    "zh": "zh", "cmn_Hani": "zh", "fake": "fake", "fake_fra": "fake", "fr": "fr", "fra_Latn": "fr"
+}
 
 
 @dataclass
@@ -146,11 +150,22 @@ def windows(tokens: numpy.ndarray, max_length: int) -> list[Item]:
 
 @torch.no_grad()
 def score(
-    model: LlamaForCausalLM, items: list[Item], batch_tokens: int, device: torch.device
+    model: LlamaForCausalLM,
+    items: list[Item],
+    batch_tokens: int,
+    device: torch.device,
+    subset: torch.Tensor | None = None,
 ) -> numpy.ndarray:
-    """Summed NLL in nats over each item's target positions"""
+    """
+    Summed NLL in nats over each item's target positions: [N], or with subset (a [vocab]
+    bool, the language's token set V_L) [N, 5]: nll, within, select, outside, outside
+    target count. For a target y in V_L, -log p(y) = within + select, with
+    within = -log p(y | y in V_L) = lse_L - z_y (the ranking inside the language) and
+    select = -log P(V_L) = lse_all - lse_L (choosing the language). A target outside V_L
+    has no within/select split: its whole -log p(y) goes to outside
+    """
     order = sorted(range(len(items)), key=lambda index: -items[index].tokens.size)
-    result = numpy.zeros(len(items), dtype=numpy.float64)
+    result = numpy.zeros(len(items) if subset is None else (len(items), 5), dtype=numpy.float64)
     position = 0
 
     while position < len(order):
@@ -177,8 +192,22 @@ def score(
             states = hidden[row, item.start - 1 : item.end - 1]
             logits = (states @ weight.T.to(states.dtype)).float()
             targets = input_ids[row, item.start : item.end]
-            nll = torch.nn.functional.cross_entropy(logits, targets, reduction="sum")
-            result[index] = nll.item()
+            if subset is None:
+                nll = torch.nn.functional.cross_entropy(logits, targets, reduction="sum")
+                result[index] = nll.item()
+                continue
+            lse_all = torch.logsumexp(logits, dim=-1)
+            lse_l = torch.logsumexp(logits.masked_fill(~subset, float("-inf")), dim=-1)
+            target_logits = logits.gather(1, targets[:, None]).squeeze(1)
+            inside = subset[targets]
+            nll = lse_all - target_logits
+            result[index] = [
+                nll.sum().item(),
+                (lse_l - target_logits)[inside].sum().item(),
+                (lse_all - lse_l)[inside].sum().item(),
+                nll[~inside].sum().item(),
+                (~inside).sum().item(),
+            ]
 
     return result
 
@@ -329,6 +358,13 @@ def main() -> None:
     parser.add_argument("--bootstrap", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-delta", action="store_true")
+    parser.add_argument(
+        "--language-sets",
+        type=Path,
+        help="dir with zh.npz, fake.npz, fr.npz (token_counts.py: 'keep' = the ids counted "
+        "> 0 in that language's training text, V_L). Adds the split of each L_ban BPB into "
+        "within-language ranking and language selection (plan Phase 1 revision)",
+    )
     arguments = parser.parse_args()
 
     started = time.time()
@@ -359,6 +395,14 @@ def main() -> None:
     encoder = Encoder(arguments.tokenizer, fake)
     rng = numpy.random.default_rng(arguments.seed)
     arrays: dict[str, numpy.ndarray] = {}
+    language_sets: dict[str, torch.Tensor] = {}
+    if arguments.language_sets is not None:
+        for name in ("zh", "fake", "fr"):
+            keep = numpy.load(arguments.language_sets / f"{name}.npz")["keep"]
+            mask = torch.zeros(vocab, dtype=torch.bool)
+            mask[torch.from_numpy(keep[keep < vocab])] = True
+            language_sets[name] = mask.to(device)
+            report[f"language_set_{name}"] = int(mask.sum())
 
     for set_name, sets in [
         ("flores", flores_items(encoder, arguments.flores, arguments.max_length)),
@@ -377,16 +421,38 @@ def main() -> None:
             if "fake" in language and not has_fake:
                 continue
             items, owner = flatten(groups)
-            nll = numpy.bincount(
-                owner,
-                weights=score(model, items, arguments.batch_tokens, device),
-                minlength=len(groups),
+            subset = language_sets.get(SPLIT_LANGUAGES.get(language, ""))
+            scored = score(model, items, arguments.batch_tokens, device, subset)
+            columns = scored if scored.ndim == 2 else scored[:, None]
+            # Item sums -> unit (sentence / document) sums, column by column
+            sums = numpy.stack(
+                [
+                    numpy.bincount(owner, weights=columns[:, c], minlength=len(groups))
+                    for c in range(columns.shape[1])
+                ],
+                axis=1,
             )
+            nll = sums[:, 0]
             key = f"bpb/{set_name}/{language}"
             arrays[f"{key}/nll"], arrays[f"{key}/bytes"] = nll, utf8
             value, low, high = bootstrap(nll, utf8, rng, arguments.bootstrap)
             report["metrics"][key] = {"value": value, "ci95": [low, high], "n": len(groups)}
             print(f"{key}: {value:.4f} [{low:.4f}, {high:.4f}]", flush=True)
+            if subset is None:
+                continue
+            # The split, in the same bits per byte (per original UTF-8 byte), so
+            # within + select + outside = the BPB above. Stored as BPB sets of their
+            # own: compare.py tau computes tau on each term
+            for column, term in enumerate(("within", "select", "outside"), start=1):
+                split_key = f"split/{set_name}/{language}/{term}"
+                arrays[f"{split_key}/nll"], arrays[f"{split_key}/bytes"] = sums[:, column], utf8
+                value, low, high = bootstrap(sums[:, column], utf8, rng, arguments.bootstrap)
+                report["metrics"][split_key] = {"value": value, "ci95": [low, high]}
+                print(f"{split_key}: {value:.4f} [{low:.4f}, {high:.4f}]", flush=True)
+            targets = sum(item.end - item.start for item in items)
+            report["metrics"][f"split/{set_name}/{language}/outside_target_fraction"] = {
+                "value": float(columns[:, 4].sum() / targets)
+            }
 
     if not arguments.no_delta:
         for source, target in DELTA_PAIRS:
