@@ -9,6 +9,11 @@ Pair evaluate.py outputs sentence by sentence (plan §6 statistics):
     uv run python scripts/embedding_ml_transfer/compare.py tau \\
         --upper b0-upper.npz --floor b0-lower-floor.npz --model x.npz --output tau.json
 
+    # tau against the shuffled control (x's L_ban rows permuted, seeds averaged)
+    uv run python scripts/embedding_ml_transfer/compare.py tau \\
+        --upper b0-upper.npz --floor b0-lower-floor.npz --model x.npz \\
+        --shuffle x-shuffle-s0.npz ... x-shuffle-s4.npz --output tau.json
+
 Every interval is a 95% paired bootstrap over the same sentences (documents) in all
 inputs, --draws resamples.
 
@@ -16,7 +21,14 @@ ruler   for each L_ban -> En pair: gap = Delta_upper - Delta_floor, its CI and C
         the gate passes for a pair when gap >= 5 x width. The plan's decision pairs are
         zh-en and fake-en (fr-en is reported too)
 tau     (BPB_floor - BPB_x) / (BPB_floor - BPB_upper) for every BPB set, and
-        Delta_x - Delta_floor for every Delta pair
+        Delta_x - Delta_floor for every Delta pair.
+        With --shuffle, also tau_shuffle (the same ratio for the shuffled control) and
+        tau - tau_shuffle = (BPB_shuffle - BPB_x) / (BPB_floor - BPB_upper), and
+        Delta_x - Delta_shuffle. tau has an alignment-free baseline: Floor sets every L_ban
+        row to one vector, so any set of distinct rows beats it a little. The shuffled
+        control keeps x's rows (norms, spread, distinctness) and only breaks which token
+        gets which row, so tau - tau_shuffle is the part of tau that comes from alignment.
+        Several --shuffle files are averaged unit by unit (as paired.py does)
 """
 
 import argparse
@@ -37,6 +49,12 @@ def load(path: Path) -> dict[str, numpy.ndarray]:
 
 def bpb_sets(arrays: dict[str, numpy.ndarray]) -> list[str]:
     return sorted(key[: -len("/nll")] for key in arrays if key.endswith("/nll"))
+
+
+def load_mean(paths: list[Path]) -> dict[str, numpy.ndarray]:
+    files = [load(p) for p in paths]
+    keys = set(files[0]).intersection(*files[1:])
+    return {k: numpy.mean([f[k] for f in files], axis=0) for k in keys}
 
 
 def delta_gain(arrays: dict[str, numpy.ndarray], pair: str) -> tuple[numpy.ndarray, numpy.ndarray]:
@@ -83,8 +101,16 @@ def ruler(arguments: argparse.Namespace) -> dict:
 
 def tau(arguments: argparse.Namespace) -> dict:
     upper, floor, model = load(arguments.upper), load(arguments.floor), load(arguments.model)
+    shuffle = load_mean(arguments.shuffle) if arguments.shuffle else None
     rng = numpy.random.default_rng(arguments.seed)
     report: dict = {"model": str(arguments.model), "tau": {}, "delta_minus_floor": {}}
+    if shuffle is not None:
+        report |= {
+            "shuffle": [str(p) for p in arguments.shuffle],
+            "tau_shuffle": {},
+            "tau_minus_shuffle": {},
+            "delta_minus_shuffle": {},
+        }
 
     for key in bpb_sets(model):
         if f"{key}/nll" not in upper or f"{key}/nll" not in floor:
@@ -103,6 +129,23 @@ def tau(arguments: argparse.Namespace) -> dict:
             "ci95": interval(ratio(picks)),
         }
 
+        if shuffle is None or f"{key}/nll" not in shuffle:
+            continue
+        assert numpy.array_equal(utf8, shuffle[f"{key}/bytes"]), f"{key}: different units"
+        nll_s = shuffle[f"{key}/nll"]
+
+        def ratio_shuffle(index: numpy.ndarray | slice) -> tuple[numpy.ndarray, numpy.ndarray]:
+            total = utf8[index].sum(-1) * LN2
+            f, x, u = (values[index].sum(-1) / total for values in nll)
+            s = nll_s[index].sum(-1) / total
+            return (f - s) / (f - u), (s - x) / (f - u)
+
+        # the same picks as tau's: tau - tau_shuffle is paired unit by unit
+        tau_s, gain = ratio_shuffle(slice(None))
+        tau_s_draws, gain_draws = ratio_shuffle(picks)
+        report["tau_shuffle"][key] = {"value": float(tau_s), "ci95": interval(tau_s_draws)}
+        report["tau_minus_shuffle"][key] = {"value": float(gain), "ci95": interval(gain_draws)}
+
     for key in model:
         if not key.startswith("delta/") or not key.endswith("/bytes"):
             continue
@@ -118,6 +161,15 @@ def tau(arguments: argparse.Namespace) -> dict:
             "ci95": interval(samples),
         }
 
+        if shuffle is None or f"delta/{pair}/bytes" not in shuffle:
+            continue
+        gain_s, _ = delta_gain(shuffle, pair)
+        samples = (gain_x[picks].sum(1) - gain_s[picks].sum(1)) / utf8[picks].sum(1)
+        report["delta_minus_shuffle"][pair] = {
+            "value": float((gain_x.sum() - gain_s.sum()) / utf8.sum()),
+            "ci95": interval(samples),
+        }
+
     return report
 
 
@@ -129,6 +181,7 @@ def main() -> None:
     parser.add_argument("--upper", type=Path, required=True)
     parser.add_argument("--floor", type=Path, required=True)
     parser.add_argument("--model", type=Path)
+    parser.add_argument("--shuffle", type=Path, nargs="+", help="tau: the shuffled control")
     parser.add_argument("--draws", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, required=True)
