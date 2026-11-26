@@ -14,7 +14,14 @@
 # Results stay in $WORK/datadecide/results/<name>/results.json. A task whose results.json
 # already exists does nothing, so resubmitting the same array only redoes what failed.
 #
-# Nothing here writes to Flock's lab7-data-curation project, which the OJ reads.
+# Each result is also logged to Flock's lab7-data-curation project as an eval run named
+# datadecide-paloma-<name>. Its summary holds only flock's <task>/<metric> and suites/<suite>
+# keys, not paloma_ppl or the token counts the OJ reads.
+#
+# --batch-tokens is 131072, four times flock's default, as the default left an H200 at about
+# 10 GB of 141. A 1B model's logits for one batch are then 131072 x 50304 FP32, about 26 GB.
+# Batching moves FP32 scores very slightly (flock's docs: per-domain bits per byte within
+# about 1e-7), so score every tier with the same value.
 #SBATCH --job-name=eval-datadecide
 #SBATCH --account=ACD115198
 #SBATCH --partition=h200_256gpu
@@ -70,10 +77,14 @@ rm -rf "$cache"
 commit=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["commit"])' "$model/datadecide.json")
 
 mkdir -p "$root/results"
+# the run name; flock's tracker logging takes it from the wandb SDK's environment
+export WANDB_NAME=datadecide-paloma-$name
 uv run --frozen flock eval run \
     --model "$model@$commit" \
     --suite paloma \
     --dtype float32 \
+    --batch-tokens 131072 \
+    --wandb-project lab7-data-curation \
     --out "$out"
 cp "$model/datadecide.json" "$out/"
 
