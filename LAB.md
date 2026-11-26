@@ -2,7 +2,7 @@
 
 ## Description
 
-Data is one of the most important parts of training a model. This lab aims to serve as an introductory course to data curation and mixing. You are find a data recipe which reaches ≤ 1.25 bits-per-bytes on Paloma’s 9 suites’ macro average using an 1B model with Llama 3.2 1B’s architecture. 
+Data is one of the most important parts of training a model. This lab aims to serve as an introductory course to data curation and mixing. You are find a data recipe which reaches ≤ 1.00 bits-per-bytes on Paloma’s 9 suites’ macro average using an 1B model with Llama 3.2 1B’s architecture. 
 
 You will compete on reducing the amount of tokens required to achieve the BPB goal. To accomplish this, you may freely use any source of data, such as published pretraining datasets (e.g., Dolma, Red Pajama, FineWeb, FinePDFs, etc.), common crawl checkpoints, or even crawl data by yourself. Nonetheless, you should run Paloma decontamination on your training data following Paloma Appendix C.1’s instructions. 
 
@@ -33,7 +33,7 @@ You are free to choose the model sizes and training horizons of your exploratory
 
 ## Evaluation
 
-Use Flock Evals to measure your 1B model’s performance on Paloma. The lab target is **≤ 1.25 bits per byte (BPB)** on the macro average across Flock’s supported 9 Paloma sources. Within each source, take the unweighted mean of its domain BPB scores. Then average the source scores, giving each source equal weight.
+Use Flock Evals to measure your 1B model’s performance on Paloma. The lab target is **≤ 1.00 bits per byte (BPB)** on the macro average across Flock’s supported 9 Paloma sources. Within each source, take the unweighted mean of its domain BPB scores. Then average the source scores, giving each source equal weight.
 
 Accept the Paloma dataset terms before your first run. Evaluate a pinned model revision in float32 on the full test split. Paloma dataset · Flock evaluation guide
 
@@ -45,7 +45,7 @@ flock eval run \
   --out results/paloma
 ```
 
-The current Flock suite covers 309 domains across 9 sources. Use the **9-source macro average** to compare experiments and include the source count when reporting it. The **1.25 BPB target** requires scores for all 9 sources.
+The current Flock suite covers 309 domains across 9 sources. Use the **9-source macro average** to compare experiments and include the source count when reporting it. The **1.00 BPB target** requires scores for all 9 sources.
 
 ## Submissions
 
